@@ -1,6 +1,8 @@
 use bevy::prelude::*;
 
-use crate::net::{broadcast, ClientInEvent, NetContext, NetMode, ServerEvent, ServerMsg};
+use crate::net::{
+    broadcast, ClientInEvent, NetContext, NetMode, PlayerNicknames, ServerEvent, ServerMsg,
+};
 use crate::{GameState, UiAssets};
 
 #[derive(Component)]
@@ -118,7 +120,11 @@ fn despawn_lobby(mut commands: Commands, q: Query<Entity, With<LobbyRoot>>) {
     }
 }
 
-fn poll_host_lobby_events(mut ctx: ResMut<NetContext>, net: Res<NetMode>) {
+fn poll_host_lobby_events(
+    mut ctx: ResMut<NetContext>,
+    net: Res<NetMode>,
+    mut nicknames: ResMut<PlayerNicknames>,
+) {
     if *net != NetMode::Host {
         return;
     }
@@ -150,6 +156,7 @@ fn poll_host_lobby_events(mut ctx: ResMut<NetContext>, net: Res<NetMode>) {
             }
             ServerEvent::Disconnected { id } => {
                 ctx.lobby_players.retain(|p| *p != id);
+                nicknames.0.remove(&id);
                 let players = ctx.lobby_players.clone();
                 let senders = senders_arc.lock().unwrap();
                 for tx in senders.values() {
@@ -157,6 +164,9 @@ fn poll_host_lobby_events(mut ctx: ResMut<NetContext>, net: Res<NetMode>) {
                         players: players.clone(),
                     });
                 }
+            }
+            ServerEvent::Hello { id, nickname } => {
+                nicknames.0.insert(id, nickname);
             }
             ServerEvent::Input { .. } => {}
         }

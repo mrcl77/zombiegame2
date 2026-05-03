@@ -2,7 +2,10 @@ use bevy::prelude::*;
 use std::net::{IpAddr, SocketAddr};
 
 use crate::audio::SfxEvent;
-use crate::net::{start_client, start_host, NetContext, NetMode, NET_PORT};
+use crate::net::{
+    sanitize_nickname, start_client, start_host, LocalNickname, NetContext, NetMode,
+    PlayerNicknames, NICKNAME_MAX_LEN, NET_PORT,
+};
 use crate::settings::GraphicsSettings;
 use crate::{GameState, UiAssets};
 
@@ -22,6 +25,9 @@ pub struct JoinPromptRoot;
 
 #[derive(Component)]
 pub struct JoinPromptIpText;
+
+#[derive(Component)]
+pub struct JoinPromptNickText;
 
 #[derive(Component)]
 pub struct JoinPromptErrorText;
@@ -50,6 +56,17 @@ pub struct SettingsSelection(pub usize);
 
 #[derive(Resource, Default)]
 pub struct MenuError(pub String);
+
+#[derive(Resource)]
+pub struct JoinPromptUiState {
+    pub nick_active: bool,
+}
+
+impl Default for JoinPromptUiState {
+    fn default() -> Self {
+        Self { nick_active: true }
+    }
+}
 
 #[derive(Resource)]
 pub struct JoinAddress {
@@ -110,6 +127,7 @@ impl Plugin for MenuPlugin {
             .init_resource::<SettingsSelection>()
             .init_resource::<MenuError>()
             .init_resource::<JoinAddress>()
+            .init_resource::<JoinPromptUiState>()
             .add_systems(OnEnter(GameState::Menu), spawn_menu)
             .add_systems(OnExit(GameState::Menu), despawn_menu)
             .add_systems(
@@ -123,7 +141,10 @@ impl Plugin for MenuPlugin {
                 Update,
                 (settings_input, settings_refresh).run_if(in_state(GameState::Settings)),
             )
-            .add_systems(OnEnter(GameState::JoinPrompt), spawn_join_prompt)
+            .add_systems(
+                OnEnter(GameState::JoinPrompt),
+                (reset_join_prompt_state, spawn_join_prompt).chain(),
+            )
             .add_systems(OnExit(GameState::JoinPrompt), despawn_join_prompt)
             .add_systems(
                 Update,
@@ -397,6 +418,7 @@ fn despawn_menu(mut commands: Commands, q: Query<Entity, With<MenuRoot>>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn menu_navigate(
     keys: Res<ButtonInput<KeyCode>>,
     mut selection: ResMut<MenuSelection>,
@@ -405,6 +427,8 @@ fn menu_navigate(
     mut net_mode: ResMut<NetMode>,
     mut error: ResMut<MenuError>,
     mut sfx: EventWriter<SfxEvent>,
+    local_nick: Res<LocalNickname>,
+    mut nicknames: ResMut<PlayerNicknames>,
 ) {
     let up = keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::KeyW);
     let down = keys.just_pressed(KeyCode::ArrowDown) || keys.just_pressed(KeyCode::KeyS);
@@ -424,6 +448,10 @@ fn menu_navigate(
                 *net_mode = NetMode::SinglePlayer;
                 ctx.my_id = 0;
                 ctx.lobby_players = vec![0];
+                nicknames.0.clear();
+                nicknames
+                    .0
+                    .insert(0, sanitize_nickname(&local_nick.0));
                 next_state.set(GameState::Playing);
             }
             1 => match start_host() {
@@ -433,6 +461,10 @@ fn menu_navigate(
                     ctx.my_id = 0;
                     ctx.lobby_players = vec![0];
                     *net_mode = NetMode::Host;
+                    nicknames.0.clear();
+                    nicknames
+                        .0
+                        .insert(0, sanitize_nickname(&local_nick.0));
                     error.0.clear();
                     next_state.set(GameState::Lobby);
                 }
@@ -734,7 +766,12 @@ fn settings_refresh(
     }
 }
 
-fn spawn_join_prompt(mut commands: Commands, assets: Res<UiAssets>, addr: Res<JoinAddress>) {
+fn spawn_join_prompt(
+    mut commands: Commands,
+    assets: Res<UiAssets>,
+    addr: Res<JoinAddress>,
+    nick: Res<LocalNickname>,
+) {
     let font = assets.font.clone();
     commands
         .spawn((
@@ -779,6 +816,30 @@ fn spawn_join_prompt(mut commands: Commands, assets: Res<UiAssets>, addr: Res<Jo
                 ));
                 spawn_divider(panel);
                 panel.spawn(TextBundle::from_section(
+                    format!("NICK (LITERY, MAX {} ZNAKOW):", NICKNAME_MAX_LEN),
+                    TextStyle {
+                        font: font.clone(),
+                        font_size: 13.0,
+                        color: TEXT_DIM,
+                    },
+                ));
+                panel.spawn((
+                    TextBundle::from_section(
+                        format!("NICK: {}_", nick.0),
+                        TextStyle {
+                            font: font.clone(),
+                            font_size: 22.0,
+                            color: TEXT_HIGHLIGHT,
+                        },
+                    )
+                    .with_style(Style {
+                        margin: UiRect::vertical(Val::Px(4.0)),
+                        ..default()
+                    }),
+                    JoinPromptNickText,
+                ));
+                spawn_divider(panel);
+                panel.spawn(TextBundle::from_section(
                     "ENTER HOST IP (DIGITS AND DOTS):",
                     TextStyle {
                         font: font.clone(),
@@ -788,15 +849,15 @@ fn spawn_join_prompt(mut commands: Commands, assets: Res<UiAssets>, addr: Res<Jo
                 ));
                 panel.spawn((
                     TextBundle::from_section(
-                        format!("IP: {}_", addr.text),
+                        format!("IP: {}", addr.text),
                         TextStyle {
                             font: font.clone(),
-                            font_size: 26.0,
-                            color: TEXT_HIGHLIGHT,
+                            font_size: 22.0,
+                            color: TEXT_NORMAL,
                         },
                     )
                     .with_style(Style {
-                        margin: UiRect::vertical(Val::Px(8.0)),
+                        margin: UiRect::vertical(Val::Px(4.0)),
                         ..default()
                     }),
                     JoinPromptIpText,
@@ -814,7 +875,7 @@ fn spawn_join_prompt(mut commands: Commands, assets: Res<UiAssets>, addr: Res<Jo
                 ));
                 spawn_divider(panel);
                 panel.spawn(TextBundle::from_section(
-                    "ENTER - CONNECT   BACKSPACE - DELETE   ESC - BACK",
+                    "TAB - SWITCH FIELD   ENTER - CONNECT   ESC - BACK",
                     TextStyle {
                         font,
                         font_size: 10.0,
@@ -829,6 +890,10 @@ fn despawn_join_prompt(mut commands: Commands, q: Query<Entity, With<JoinPromptR
     for e in &q {
         commands.entity(e).despawn_recursive();
     }
+}
+
+fn reset_join_prompt_state(mut s: ResMut<JoinPromptUiState>) {
+    s.nick_active = true;
 }
 
 fn keycode_to_digit(k: KeyCode) -> Option<char> {
@@ -847,26 +912,104 @@ fn keycode_to_digit(k: KeyCode) -> Option<char> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+fn keycode_to_letter(k: KeyCode) -> Option<char> {
+    match k {
+        KeyCode::KeyA => Some('A'),
+        KeyCode::KeyB => Some('B'),
+        KeyCode::KeyC => Some('C'),
+        KeyCode::KeyD => Some('D'),
+        KeyCode::KeyE => Some('E'),
+        KeyCode::KeyF => Some('F'),
+        KeyCode::KeyG => Some('G'),
+        KeyCode::KeyH => Some('H'),
+        KeyCode::KeyI => Some('I'),
+        KeyCode::KeyJ => Some('J'),
+        KeyCode::KeyK => Some('K'),
+        KeyCode::KeyL => Some('L'),
+        KeyCode::KeyM => Some('M'),
+        KeyCode::KeyN => Some('N'),
+        KeyCode::KeyO => Some('O'),
+        KeyCode::KeyP => Some('P'),
+        KeyCode::KeyQ => Some('Q'),
+        KeyCode::KeyR => Some('R'),
+        KeyCode::KeyS => Some('S'),
+        KeyCode::KeyT => Some('T'),
+        KeyCode::KeyU => Some('U'),
+        KeyCode::KeyV => Some('V'),
+        KeyCode::KeyW => Some('W'),
+        KeyCode::KeyX => Some('X'),
+        KeyCode::KeyY => Some('Y'),
+        KeyCode::KeyZ => Some('Z'),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn join_prompt_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut addr: ResMut<JoinAddress>,
+    mut nick: ResMut<LocalNickname>,
+    mut ui_state: ResMut<JoinPromptUiState>,
     mut ctx: ResMut<NetContext>,
     mut net_mode: ResMut<NetMode>,
     mut next_state: ResMut<NextState<GameState>>,
     mut ip_text: Query<
         &mut Text,
-        (With<JoinPromptIpText>, Without<JoinPromptErrorText>),
+        (
+            With<JoinPromptIpText>,
+            Without<JoinPromptErrorText>,
+            Without<JoinPromptNickText>,
+        ),
+    >,
+    mut nick_text: Query<
+        &mut Text,
+        (
+            With<JoinPromptNickText>,
+            Without<JoinPromptErrorText>,
+            Without<JoinPromptIpText>,
+        ),
     >,
     mut err_text: Query<
         &mut Text,
-        (With<JoinPromptErrorText>, Without<JoinPromptIpText>),
+        (
+            With<JoinPromptErrorText>,
+            Without<JoinPromptIpText>,
+            Without<JoinPromptNickText>,
+        ),
     >,
     mut sfx: EventWriter<SfxEvent>,
 ) {
+    // Default to nick field on first appearance.  We start with nick active
+    // so the player types their name first and TABs to the IP.
+    if keys.just_pressed(KeyCode::Tab) {
+        ui_state.nick_active = !ui_state.nick_active;
+        sfx.send(SfxEvent::MenuMove);
+    }
+
     let mut changed = false;
     for key in keys.get_just_pressed() {
-        if let Some(d) = keycode_to_digit(*key) {
+        if *key == KeyCode::Tab {
+            continue;
+        }
+        if ui_state.nick_active {
+            if let Some(c) = keycode_to_letter(*key) {
+                if nick.0.chars().count() < NICKNAME_MAX_LEN {
+                    nick.0.push(c);
+                    changed = true;
+                    sfx.send(SfxEvent::MenuMove);
+                }
+            } else if let Some(d) = keycode_to_digit(*key) {
+                if nick.0.chars().count() < NICKNAME_MAX_LEN {
+                    nick.0.push(d);
+                    changed = true;
+                    sfx.send(SfxEvent::MenuMove);
+                }
+            } else if *key == KeyCode::Backspace {
+                nick.0.pop();
+                changed = true;
+                sfx.send(SfxEvent::MenuMove);
+            }
+        } else if let Some(d) = keycode_to_digit(*key) {
             if addr.text.len() < 21 {
                 addr.text.push(d);
                 changed = true;
@@ -885,8 +1028,29 @@ fn join_prompt_input(
         }
     }
     if changed {
+        if let Ok(mut text) = nick_text.get_single_mut() {
+            text.sections[0].value = if ui_state.nick_active {
+                format!("NICK: {}_", nick.0)
+            } else {
+                format!("NICK: {}", nick.0)
+            };
+            text.sections[0].style.color = if ui_state.nick_active {
+                TEXT_HIGHLIGHT
+            } else {
+                TEXT_NORMAL
+            };
+        }
         if let Ok(mut text) = ip_text.get_single_mut() {
-            text.sections[0].value = format!("IP: {}_", addr.text);
+            text.sections[0].value = if ui_state.nick_active {
+                format!("IP: {}", addr.text)
+            } else {
+                format!("IP: {}_", addr.text)
+            };
+            text.sections[0].style.color = if ui_state.nick_active {
+                TEXT_NORMAL
+            } else {
+                TEXT_HIGHLIGHT
+            };
         }
     }
     if keys.just_pressed(KeyCode::Escape) {
@@ -900,7 +1064,9 @@ fn join_prompt_input(
         match parse {
             Ok(ip) => {
                 let sock = SocketAddr::new(ip, NET_PORT);
-                match start_client(sock) {
+                let clean_nick = sanitize_nickname(&nick.0);
+                nick.0 = clean_nick.clone();
+                match start_client(sock, &clean_nick) {
                     Ok(client) => {
                         ctx.disconnect();
                         ctx.client = Some(client);

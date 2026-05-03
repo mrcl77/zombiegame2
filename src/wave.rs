@@ -2,8 +2,9 @@ use bevy::prelude::*;
 use rand::seq::SliceRandom;
 use std::collections::VecDeque;
 
-use crate::net::is_authoritative;
-use crate::player::Player;
+use crate::net::{is_authoritative, NetEntities};
+use crate::map::{PLAYER_SPAWN_X, PLAYER_SPAWN_Y};
+use crate::player::{spawn_player_entity, DeadPlayers, LogicalPos, Player, PlayerAssets};
 use crate::zombie::{SpawnZombieEvent, Zombie, ZombieKind};
 use crate::{gameplay_active, GameState};
 
@@ -103,18 +104,24 @@ fn build_wave_queue(wave: u32, player_count: usize) -> VecDeque<ZombieKind> {
     VecDeque::from(v)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wave_system(
     time: Res<Time>,
+    mut commands: Commands,
     mut state: ResMut<WaveState>,
     mut spawn_events: EventWriter<SpawnZombieEvent>,
     zombies: Query<(), With<Zombie>>,
-    players: Query<(), With<Player>>,
+    players: Query<&Transform, With<Player>>,
+    mut dead_players: ResMut<DeadPlayers>,
+    player_assets: Res<PlayerAssets>,
+    mut net_entities: ResMut<NetEntities>,
 ) {
     if state.in_break {
         state.break_timer.tick(time.delta());
         if state.break_timer.finished() {
             state.current_wave += 1;
-            state.spawn_queue = build_wave_queue(state.current_wave, players.iter().count());
+            let alive = players.iter().count() + dead_players.0.len();
+            state.spawn_queue = build_wave_queue(state.current_wave, alive);
             state.zombies_to_spawn = state.spawn_queue.len() as u32;
             state.spawn_timer.reset();
             state.in_break = false;
@@ -130,6 +137,20 @@ fn wave_system(
             }
         }
     } else if zombies.is_empty() {
+        // Wave cleared — respawn dead players before the break
+        for (i, id) in dead_players.0.drain(..).enumerate() {
+            let col = i % 4;
+            let row = i / 4;
+            let pos = Vec2::new(
+                PLAYER_SPAWN_X + col as f32 * 64.0,
+                PLAYER_SPAWN_Y - row as f32 * 64.0,
+            );
+            let ent = spawn_player_entity(&mut commands, &player_assets, id, pos);
+            // Wave respawns happen on the authoritative side (host/SP) so
+            // every respawned player needs the interp buffer too.
+            commands.entity(ent).insert(LogicalPos::at(pos));
+            net_entities.players.insert(id, ent);
+        }
         state.in_break = true;
         state.break_timer.reset();
     }

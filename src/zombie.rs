@@ -3,13 +3,13 @@ use rand::Rng;
 
 use crate::bullet::{ExplodeEvent, EXPLODER_EXPLOSION_PLAYER_DAMAGE, EXPLODER_EXPLOSION_RADIUS, EXPLODER_EXPLOSION_ZOMBIE_DAMAGE};
 use crate::map::{
-    bfs_distance_field, in_bounds, nav_idx, tile_center, world_to_tile, MapObstacles, NavGrid,
-    BARRIER_NORTH_Y, BARRIER_SOUTH_Y, BARRIER_UNDERGROUND_Y, MAP_HEIGHT, MAP_WIDTH,
+    bfs_distance_field, in_bounds, nav_idx, spawn_point_world, tile_center, world_to_tile,
+    MapObstacles, MapSegmentUnlockState, NavGrid, SpawnPointSpec, SPAWN_POINTS, TILE_SIZE,
 };
 use crate::zones::ZoneState;
 use crate::net::{is_authoritative, NetContext, NetEntities, NetId};
 use crate::pixelart::{Canvas, Rgba};
-use crate::player::{Player, PlayerDamagedEvent, PLAYER_RADIUS};
+use crate::player::{Player, PlayerDamagedEvent, PlayerDiedEvent, PLAYER_RADIUS};
 use crate::{gameplay_active, GameState};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -87,6 +87,13 @@ impl ZombieKind {
             Self::Giant => 40,
         }
     }
+
+    pub fn kill_reward(self) -> u32 {
+        match self {
+            Self::Giant => 500,
+            _ => 20,
+        }
+    }
 }
 
 #[derive(Component)]
@@ -94,12 +101,55 @@ pub struct Zombie {
     pub hp: i32,
     pub speed: f32,
     pub kind: ZombieKind,
+    /// Decaying seconds of hit-reaction flash — sprite tints toward white
+    /// while > 0.  Set on every damage instance, faded in
+    /// `update_zombie_hit_flash`.
+    pub hit_flash: f32,
+    /// Counts down between blood drips when the zombie is wounded; when
+    /// it hits zero a tiny blood splat is dropped at their feet.
+    pub bleed_timer: f32,
+}
+
+pub const ZOMBIE_HIT_FLASH_DURATION: f32 = 0.12;
+
+/// Floating damage number above a hit zombie — spawned at the bullet impact
+/// point, drifts upward while fading.  Pure cosmetic.
+#[derive(Component)]
+pub struct DamageNumber {
+    pub lifetime: f32,
+    pub max_lifetime: f32,
+    pub velocity: Vec2,
+}
+
+/// Event raised on every successful hit so the FX system can spawn a
+/// floating number without each damage site needing to know about UI.
+#[derive(Event)]
+pub struct DamageNumberEvent {
+    pub pos: Vec2,
+    pub amount: i32,
 }
 
 #[derive(Event)]
 pub struct ZombieKilledEvent {
     pub kind: ZombieKind,
     pub by_explosion: bool,
+    /// World-space position where the zombie died — used by the blood-stain
+    /// FX (and is otherwise ignored by score / achievement listeners).
+    pub pos: Vec2,
+}
+
+/// Fading blood splat dropped at a zombie's last position.  Pure cosmetic
+/// — no obstacle, no replication.  Lifetime ticks down in
+/// `update_blood_stains` and the entity self-despawns when it hits zero.
+#[derive(Component)]
+pub struct BloodStain {
+    pub lifetime: f32,
+    pub max_lifetime: f32,
+}
+
+#[derive(Resource)]
+pub struct BloodAssets {
+    pub stains: [Handle<Image>; 3],
 }
 
 #[derive(Event, Default)]
@@ -110,11 +160,32 @@ pub struct SpawnZombieEvent {
 pub const BURN_DURATION: f32 = 10.0;
 pub const BURN_DPS: f32 = 3.5;
 
+const GIANT_ATTACK_RANGE: f32 = 120.0;
+const GIANT_ATTACK_COOLDOWN: f32 = 4.0;
+const TOXIC_CLOUD_RADIUS: f32 = 40.0;
+const TOXIC_CLOUD_LIFETIME: f32 = 3.0;
+const TOXIC_CLOUD_DPS: f32 = 8.0;
+const GIANT_HP_BAR_WIDTH: f32 = 50.0;
+
 #[derive(Component)]
 pub struct BurnEffect {
     pub remaining: f32,
     pub accumulated: f32,
 }
+
+#[derive(Component)]
+pub struct GiantAttack {
+    pub cooldown: f32,
+}
+
+#[derive(Component)]
+pub struct ToxicCloud {
+    pub lifetime: f32,
+    pub tick: f32,
+}
+
+#[derive(Component)]
+pub struct ZombieHpBar;
 
 #[derive(Resource)]
 pub struct ZombieAssets {
@@ -123,6 +194,7 @@ pub struct ZombieAssets {
     pub exploder: Handle<Image>,
     pub burning: Handle<Image>,
     pub giant: Handle<Image>,
+    pub toxic_cloud: Handle<Image>,
 }
 
 impl ZombieAssets {
@@ -143,7 +215,8 @@ impl Plugin for ZombiePlugin {
     fn build(&self, app: &mut App) {
         app.add_event::<SpawnZombieEvent>()
             .add_event::<ZombieKilledEvent>()
-            .add_systems(Startup, setup_zombie_assets)
+            .add_event::<DamageNumberEvent>()
+            .add_systems(Startup, (setup_zombie_assets, setup_blood_assets))
             .add_systems(OnExit(GameState::Playing), despawn_all_zombies)
             .add_systems(
                 FixedUpdate,
@@ -152,13 +225,414 @@ impl Plugin for ZombiePlugin {
                     update_nav_flow,
                     zombie_movement,
                     zombie_attack,
+                    giant_toxic_attack,
+                    toxic_cloud_tick,
                     burn_tick_system,
                 )
                     .chain()
                     .run_if(gameplay_active)
                     .run_if(is_authoritative),
+            )
+            .add_systems(
+                Update,
+                (
+                    update_zombie_hp_bars,
+                    spawn_blood_on_kill,
+                    spawn_blood_on_player_death,
+                    update_blood_stains,
+                    update_zombie_hit_flash,
+                    spawn_damage_numbers,
+                    update_damage_numbers,
+                    spawn_score_popups,
+                    drip_wounded_blood,
+                )
+                    .run_if(in_state(GameState::Playing)),
             );
     }
+}
+
+/// Wounded zombies drip small blood drops behind them on the ground.  The
+/// drip rate is tied to the per-zombie `bleed_timer` field which is reset
+/// to a randomised cooldown after every drop.
+fn drip_wounded_blood(
+    mut commands: Commands,
+    time: Res<Time>,
+    assets: Res<BloodAssets>,
+    mut q: Query<(&Transform, &mut Zombie)>,
+) {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let dt = time.delta_seconds();
+    for (t, mut zombie) in &mut q {
+        if zombie.hp <= 0 {
+            continue;
+        }
+        let max_hp = zombie.kind.base_hp();
+        // Only drip while wounded — under 60% HP.
+        if zombie.hp * 100 / max_hp.max(1) > 60 {
+            continue;
+        }
+        zombie.bleed_timer -= dt;
+        if zombie.bleed_timer > 0.0 {
+            continue;
+        }
+        // Faster drip rate the more wounded the zombie is, scaled by HP.
+        let severity = 1.0 - (zombie.hp as f32 / max_hp as f32).clamp(0.0, 1.0);
+        zombie.bleed_timer = (1.4 - severity * 0.9).max(0.35) + rng.gen_range(-0.1..0.1);
+
+        let pos = t.translation.truncate()
+            + Vec2::new(rng.gen_range(-4.0..4.0), rng.gen_range(-6.0..2.0));
+        let size = rng.gen_range(8.0..14.0);
+        let life = rng.gen_range(2.5..4.0);
+        let variant = rng.gen_range(0..3);
+        commands.spawn((
+            SpriteBundle {
+                texture: assets.stains[variant].clone(),
+                sprite: Sprite {
+                    custom_size: Some(Vec2::splat(size)),
+                    color: Color::srgba(1.0, 1.0, 1.0, 0.85),
+                    ..default()
+                },
+                transform: Transform::from_xyz(pos.x, pos.y, -12.7)
+                    .with_rotation(Quat::from_rotation_z(
+                        rng.gen_range(-std::f32::consts::PI..std::f32::consts::PI),
+                    )),
+                ..default()
+            },
+            BloodStain {
+                lifetime: life,
+                max_lifetime: life,
+            },
+        ));
+    }
+}
+
+/// Spawns a green floating "+$N" label whenever a zombie dies, where N is
+/// the kill reward.  Uses the same `DamageNumber` lifetime + drift system
+/// for free animation, just with a green tint and a slightly longer life.
+fn spawn_score_popups(
+    mut commands: Commands,
+    mut events: EventReader<ZombieKilledEvent>,
+    ui: Res<crate::UiAssets>,
+) {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    for ev in events.read() {
+        let reward = ev.kind.kill_reward();
+        let lifetime = 1.1;
+        // Bigger / brighter for the Giant since they pay out 25× normal.
+        let (font_size, color) = if reward >= 100 {
+            (22.0, Color::srgba(1.0, 0.95, 0.55, 1.0))
+        } else {
+            (15.0, Color::srgba(0.55, 0.95, 0.5, 1.0))
+        };
+        commands.spawn((
+            Text2dBundle {
+                text: Text::from_section(
+                    format!("+${}", reward),
+                    TextStyle {
+                        font: ui.font.clone(),
+                        font_size,
+                        color,
+                    },
+                ),
+                transform: Transform::from_xyz(
+                    ev.pos.x + rng.gen_range(-6.0..6.0),
+                    ev.pos.y + 26.0,
+                    9.85,
+                ),
+                ..default()
+            },
+            DamageNumber {
+                lifetime,
+                max_lifetime: lifetime,
+                velocity: Vec2::new(rng.gen_range(-18.0..18.0), 50.0),
+            },
+        ));
+    }
+}
+
+fn spawn_damage_numbers(
+    mut commands: Commands,
+    mut events: EventReader<DamageNumberEvent>,
+    ui: Res<crate::UiAssets>,
+) {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    for ev in events.read() {
+        if ev.amount <= 0 {
+            continue;
+        }
+        // Bigger / brighter numbers for big damage — readable from far away.
+        let (font_size, color) = if ev.amount >= 18 {
+            (18.0, Color::srgba(1.0, 0.85, 0.30, 1.0))
+        } else if ev.amount >= 6 {
+            (14.0, Color::srgba(1.0, 0.95, 0.55, 1.0))
+        } else {
+            (12.0, Color::srgba(1.0, 1.0, 0.85, 0.95))
+        };
+        let lifetime = 0.7;
+        let jitter = Vec2::new(rng.gen_range(-6.0..6.0), rng.gen_range(0.0..6.0));
+        commands.spawn((
+            Text2dBundle {
+                text: Text::from_section(
+                    format!("{}", ev.amount),
+                    TextStyle {
+                        font: ui.font.clone(),
+                        font_size,
+                        color,
+                    },
+                ),
+                transform: Transform::from_xyz(ev.pos.x + jitter.x, ev.pos.y + 14.0 + jitter.y, 9.8),
+                ..default()
+            },
+            DamageNumber {
+                lifetime,
+                max_lifetime: lifetime,
+                velocity: Vec2::new(rng.gen_range(-30.0..30.0), 60.0),
+            },
+        ));
+    }
+}
+
+fn update_damage_numbers(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut q: Query<(Entity, &mut DamageNumber, &mut Transform, &mut Text)>,
+) {
+    let dt = time.delta_seconds();
+    for (e, mut dn, mut transform, mut text) in &mut q {
+        dn.lifetime -= dt;
+        if dn.lifetime <= 0.0 {
+            commands.entity(e).despawn_recursive();
+            continue;
+        }
+        // Drift up + decelerate so the numbers settle at the apex.
+        dn.velocity *= 1.0 - 1.5 * dt;
+        transform.translation += (dn.velocity * dt).extend(0.0);
+        let pct = (dn.lifetime / dn.max_lifetime).clamp(0.0, 1.0);
+        for sec in &mut text.sections {
+            sec.style.color.set_alpha(pct.powf(1.2));
+        }
+    }
+}
+
+/// Drops a chunky blood pool plus several scattered drops at the spot where
+/// a player died.  Bigger and longer-lasting than the zombie blood splats.
+fn spawn_blood_on_player_death(
+    mut commands: Commands,
+    assets: Res<BloodAssets>,
+    mut events: EventReader<PlayerDiedEvent>,
+) {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    for ev in events.read() {
+        // Big central pool — generous lifetime so the body's mark persists
+        // through a respawn cycle.
+        let main_size = 80.0;
+        let main_life = 12.0;
+        commands.spawn((
+            SpriteBundle {
+                texture: assets.stains[1].clone(),
+                sprite: Sprite {
+                    custom_size: Some(Vec2::splat(main_size)),
+                    color: Color::srgba(1.0, 1.0, 1.0, 0.95),
+                    ..default()
+                },
+                transform: Transform::from_xyz(ev.pos.x, ev.pos.y, -12.4)
+                    .with_rotation(Quat::from_rotation_z(
+                        rng.gen_range(-std::f32::consts::PI..std::f32::consts::PI),
+                    )),
+                ..default()
+            },
+            BloodStain {
+                lifetime: main_life,
+                max_lifetime: main_life,
+            },
+        ));
+        // Scatter 6 smaller drops in a ~80 px radius around the body.
+        for _ in 0..6 {
+            let angle: f32 = rng.gen_range(0.0..std::f32::consts::TAU);
+            let dist = rng.gen_range(28.0..70.0);
+            let pos = ev.pos + Vec2::new(angle.cos(), angle.sin()) * dist;
+            let size = rng.gen_range(20.0..38.0);
+            let variant = rng.gen_range(0..3);
+            let life = rng.gen_range(8.0..11.0);
+            commands.spawn((
+                SpriteBundle {
+                    texture: assets.stains[variant].clone(),
+                    sprite: Sprite {
+                        custom_size: Some(Vec2::splat(size)),
+                        color: Color::srgba(1.0, 1.0, 1.0, 0.9),
+                        ..default()
+                    },
+                    transform: Transform::from_xyz(pos.x, pos.y, -12.45)
+                        .with_rotation(Quat::from_rotation_z(
+                            rng.gen_range(-std::f32::consts::PI..std::f32::consts::PI),
+                        )),
+                    ..default()
+                },
+                BloodStain {
+                    lifetime: life,
+                    max_lifetime: life,
+                },
+            ));
+        }
+    }
+}
+
+/// Tints damaged zombies briefly toward white so the hit reads visually
+/// even when the HP bar isn't visible.  The `hit_flash` field is bumped
+/// at every damage site in `bullet.rs`; we fade it back to 0 here.
+fn update_zombie_hit_flash(
+    time: Res<Time>,
+    mut q: Query<(&mut Zombie, &mut Sprite)>,
+) {
+    let dt = time.delta_seconds();
+    for (mut zombie, mut sprite) in &mut q {
+        if zombie.hit_flash <= 0.0 {
+            // Reset to default tint once the flash is over.  Using
+            // `Color::WHITE` keeps the texture's own colours intact.
+            if sprite.color != Color::WHITE {
+                sprite.color = Color::WHITE;
+            }
+            continue;
+        }
+        zombie.hit_flash = (zombie.hit_flash - dt).max(0.0);
+        let pct = (zombie.hit_flash / ZOMBIE_HIT_FLASH_DURATION).clamp(0.0, 1.0);
+        // Lerp toward bright over-saturated white.  Stronger at the start
+        // of the flash, fading back to white (default).
+        let mix = pct;
+        let r = 1.0 + mix * 1.4;
+        let g = 1.0 + mix * 1.4;
+        let b = 1.0 + mix * 1.4;
+        sprite.color = Color::srgba(r, g, b, 1.0);
+    }
+}
+
+fn setup_blood_assets(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+    commands.insert_resource(BloodAssets {
+        stains: [
+            images.add(build_blood_stain_image(0)),
+            images.add(build_blood_stain_image(1)),
+            images.add(build_blood_stain_image(2)),
+        ],
+    });
+}
+
+const BLOOD_STAIN_LIFETIME: f32 = 5.0;
+
+fn spawn_blood_on_kill(
+    mut commands: Commands,
+    assets: Res<BloodAssets>,
+    mut events: EventReader<ZombieKilledEvent>,
+) {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    for ev in events.read() {
+        // Bigger splat for explosion / giant deaths so the chunkier kills
+        // read appropriately gory.
+        let base_size = if ev.by_explosion {
+            42.0
+        } else {
+            match ev.kind {
+                ZombieKind::Giant => 60.0,
+                ZombieKind::Exploder => 44.0,
+                _ => 30.0,
+            }
+        };
+        let scatter = rng.gen_range(0.85..1.15);
+        let jitter = Vec2::new(rng.gen_range(-3.0..3.0), rng.gen_range(-3.0..3.0));
+        let variant = rng.gen_range(0..3);
+        let rot = rng.gen_range(-std::f32::consts::PI..std::f32::consts::PI);
+        commands.spawn((
+            SpriteBundle {
+                texture: assets.stains[variant].clone(),
+                sprite: Sprite {
+                    custom_size: Some(Vec2::splat(base_size * scatter)),
+                    color: Color::srgba(1.0, 1.0, 1.0, 0.95),
+                    ..default()
+                },
+                transform: Transform::from_xyz(ev.pos.x + jitter.x, ev.pos.y + jitter.y, -12.5)
+                    .with_rotation(Quat::from_rotation_z(rot)),
+                ..default()
+            },
+            BloodStain {
+                lifetime: BLOOD_STAIN_LIFETIME,
+                max_lifetime: BLOOD_STAIN_LIFETIME,
+            },
+        ));
+    }
+}
+
+fn update_blood_stains(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut q: Query<(Entity, &mut BloodStain, &mut Sprite)>,
+) {
+    let dt = time.delta_seconds();
+    for (e, mut stain, mut sprite) in &mut q {
+        stain.lifetime -= dt;
+        if stain.lifetime <= 0.0 {
+            commands.entity(e).despawn_recursive();
+            continue;
+        }
+        let pct = (stain.lifetime / stain.max_lifetime).clamp(0.0, 1.0);
+        // Hold full alpha for the first ~30%, then fade out smoothly.
+        let alpha = if pct > 0.7 { 0.95 } else { (pct / 0.7) * 0.95 };
+        sprite.color.set_alpha(alpha);
+    }
+}
+
+fn build_blood_stain_image(variant: u32) -> Image {
+    let outline: Rgba = [40, 6, 6, 255];
+    let dark: Rgba = [110, 14, 14, 255];
+    let mid: Rgba = [170, 22, 22, 255];
+    let bright: Rgba = [210, 36, 36, 255];
+
+    let size: i32 = 32;
+    let mut c = Canvas::new(size, size);
+    c.fill_rect(0, 0, size, size, [0, 0, 0, 0]);
+    let cx = size / 2;
+    let cy = size / 2;
+    // Main pool — irregular blob.
+    c.fill_circle(cx, cy, 9, outline);
+    c.fill_circle(cx, cy, 8, dark);
+    c.fill_circle(cx - 1, cy - 1, 6, mid);
+    c.fill_circle(cx - 2, cy - 2, 3, bright);
+    // Splatter droplets — pattern varies by `variant` so successive deaths
+    // don't drop identical blobs on top of each other.
+    let droplets: &[(i32, i32, i32)] = match variant {
+        0 => &[
+            (cx + 11, cy - 4, 2),
+            (cx + 8, cy + 9, 2),
+            (cx - 12, cy + 2, 2),
+            (cx - 6, cy + 12, 1),
+            (cx + 5, cy - 12, 1),
+        ],
+        1 => &[
+            (cx + 13, cy + 3, 2),
+            (cx - 11, cy - 5, 2),
+            (cx - 4, cy - 13, 1),
+            (cx + 9, cy + 11, 1),
+            (cx - 9, cy + 9, 2),
+        ],
+        _ => &[
+            (cx - 13, cy + 1, 2),
+            (cx + 12, cy - 6, 2),
+            (cx + 4, cy + 13, 1),
+            (cx - 7, cy - 11, 1),
+            (cx + 11, cy + 8, 1),
+            (cx - 11, cy - 9, 1),
+        ],
+    };
+    for &(x, y, r) in droplets {
+        if (0..size).contains(&x) && (0..size).contains(&y) {
+            c.fill_circle(x, y, r, dark);
+            c.fill_circle(x, y, r.saturating_sub(1), mid);
+        }
+    }
+    c.into_image()
 }
 
 fn setup_zombie_assets(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
@@ -168,6 +642,7 @@ fn setup_zombie_assets(mut commands: Commands, mut images: ResMut<Assets<Image>>
         exploder: images.add(build_exploder_zombie_image()),
         burning: images.add(build_burning_zombie_image()),
         giant: images.add(build_giant_zombie_image()),
+        toxic_cloud: images.add(build_toxic_cloud_image()),
     });
 }
 
@@ -627,6 +1102,21 @@ fn build_giant_zombie_image() -> Image {
     c.into_image()
 }
 
+fn build_toxic_cloud_image() -> Image {
+    let outer: Rgba = [60, 90, 30, 60];
+    let mid: Rgba = [50, 110, 25, 120];
+    let inner: Rgba = [40, 130, 20, 180];
+    let core: Rgba = [30, 150, 15, 200];
+
+    let mut c = Canvas::new(16, 16);
+    c.fill_circle(8, 8, 7, outer);
+    c.fill_circle(8, 8, 5, mid);
+    c.fill_circle(6, 7, 3, inner);
+    c.fill_circle(10, 9, 3, inner);
+    c.fill_circle(8, 8, 2, core);
+    c.into_image()
+}
+
 pub fn spawn_zombie_entity(
     commands: &mut Commands,
     assets: &ZombieAssets,
@@ -636,7 +1126,7 @@ pub fn spawn_zombie_entity(
     speed: f32,
     kind: ZombieKind,
 ) -> Entity {
-    commands
+    let entity = commands
         .spawn((
             SpriteBundle {
                 texture: assets.image_for(kind),
@@ -647,50 +1137,134 @@ pub fn spawn_zombie_entity(
                 transform: Transform::from_xyz(pos.x, pos.y, 5.0),
                 ..default()
             },
-            Zombie { hp, speed, kind },
+            Zombie {
+                hp,
+                speed,
+                kind,
+                hit_flash: 0.0,
+                bleed_timer: 0.0,
+            },
             NetId(net_id),
         ))
-        .id()
+        .id();
+
+    if kind == ZombieKind::Giant {
+        commands
+            .entity(entity)
+            .insert(GiantAttack { cooldown: 2.0 })
+            .with_children(|parent| {
+                // HP bar background
+                parent.spawn(SpriteBundle {
+                    sprite: Sprite {
+                        custom_size: Some(Vec2::new(GIANT_HP_BAR_WIDTH, 5.0)),
+                        color: Color::srgba(0.1, 0.1, 0.1, 0.7),
+                        ..default()
+                    },
+                    transform: Transform::from_xyz(0.0, 40.0, 1.0),
+                    ..default()
+                });
+                // HP bar fill
+                parent.spawn((
+                    SpriteBundle {
+                        sprite: Sprite {
+                            custom_size: Some(Vec2::new(GIANT_HP_BAR_WIDTH, 5.0)),
+                            color: Color::srgb(0.8, 0.15, 0.15),
+                            anchor: bevy::sprite::Anchor::CenterLeft,
+                            ..default()
+                        },
+                        transform: Transform::from_xyz(
+                            -GIANT_HP_BAR_WIDTH / 2.0,
+                            40.0,
+                            1.1,
+                        ),
+                        ..default()
+                    },
+                    ZombieHpBar,
+                ));
+            });
+    }
+
+    entity
 }
 
 const MAX_ALIVE_ZOMBIES: usize = 70;
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_zombie_listener(
     mut commands: Commands,
     mut events: EventReader<SpawnZombieEvent>,
     assets: Res<ZombieAssets>,
     mut ctx: ResMut<NetContext>,
-    zone_state: Res<ZoneState>,
+    _zone_state: Res<ZoneState>,
+    nav: Res<NavGrid>,
+    segments: Res<MapSegmentUnlockState>,
     existing: Query<(), With<Zombie>>,
+    _players: Query<&Transform, With<Player>>,
 ) {
     let alive = existing.iter().count();
     let mut spawned = 0;
     let mut rng = rand::thread_rng();
+
+    // Pick a spawn point spec for this zombie.  Spawn points belonging to
+    // a locked segment are excluded — zombies don't emerge from areas
+    // the players haven't paid to open up yet.
+    let exterior: Vec<&SpawnPointSpec> = SPAWN_POINTS
+        .iter()
+        .filter(|s| !s.interior_only && segments.is_unlocked(s.segment_idx))
+        .collect();
+    let interior: Vec<&SpawnPointSpec> = SPAWN_POINTS
+        .iter()
+        .filter(|s| s.interior_only && segments.is_unlocked(s.segment_idx))
+        .collect();
+
     for ev in events.read() {
         if alive + spawned >= MAX_ALIVE_ZOMBIES {
             continue;
         }
         spawned += 1;
-        let half_w = MAP_WIDTH / 2.0 - 30.0;
 
-        let mut y_min = BARRIER_SOUTH_Y;
-        let mut y_max = BARRIER_NORTH_Y;
-        if zone_state.unlocked[1] {
-            y_max = MAP_HEIGHT / 2.0 - 30.0;
-        }
-        if zone_state.unlocked[2] {
-            y_min = BARRIER_UNDERGROUND_Y;
-        }
-        if zone_state.unlocked[3] {
-            y_min = -(MAP_HEIGHT / 2.0 - 30.0);
-        }
-
-        let pos = match rng.gen_range(0..4) {
-            0 => Vec2::new(rng.gen_range(-half_w..half_w), y_max),
-            1 => Vec2::new(rng.gen_range(-half_w..half_w), y_min),
-            2 => Vec2::new(-half_w, rng.gen_range(y_min..y_max)),
-            _ => Vec2::new(half_w, rng.gen_range(y_min..y_max)),
+        let pool: &Vec<&SpawnPointSpec> = if matches!(ev.kind, ZombieKind::Fast)
+            && !interior.is_empty()
+            && rng.gen_bool(0.35)
+        {
+            &interior
+        } else if !exterior.is_empty() {
+            &exterior
+        } else {
+            &interior
         };
+        let sp = pool[rng.gen_range(0..pool.len())];
+        let base_pos = spawn_point_world(sp);
+
+        // Nudge a few tiles into the room so the zombie isn't intersecting the wall.
+        let inward = match sp.side {
+            crate::map::WallSide::N => Vec2::new(0.0, -TILE_SIZE * 1.5),
+            crate::map::WallSide::S => Vec2::new(0.0, TILE_SIZE * 1.5),
+            crate::map::WallSide::E => Vec2::new(-TILE_SIZE * 1.5, 0.0),
+            crate::map::WallSide::W => Vec2::new(TILE_SIZE * 1.5, 0.0),
+        };
+        let mut pos = base_pos + inward;
+
+        // Snap to the nearest walkable tile within a small radius if we landed
+        // on something solid (a wall column, decor, etc.).
+        let (c0, r0) = world_to_tile(pos);
+        if !(in_bounds(c0, r0) && nav.walkable[nav_idx(c0, r0)]) {
+            'snap: for ring in 1_i32..=4 {
+                for dr in -ring..=ring {
+                    for dc in -ring..=ring {
+                        if dc.abs() != ring && dr.abs() != ring {
+                            continue;
+                        }
+                        let (c, r) = (c0 + dc, r0 + dr);
+                        if in_bounds(c, r) && nav.walkable[nav_idx(c, r)] {
+                            pos = tile_center(c, r);
+                            break 'snap;
+                        }
+                    }
+                }
+            }
+        }
+
         let base = ev.kind.base_speed();
         let jitter: f32 = match ev.kind {
             ZombieKind::Normal => rng.gen_range(-15.0..35.0),
@@ -961,7 +1535,11 @@ fn zombie_attack(
                 zombie_damage: EXPLODER_EXPLOSION_ZOMBIE_DAMAGE,
                 player_damage: EXPLODER_EXPLOSION_PLAYER_DAMAGE,
             });
-            killed.send(ZombieKilledEvent { kind: zombie.kind, by_explosion: false });
+            killed.send(ZombieKilledEvent {
+                kind: zombie.kind,
+                by_explosion: false,
+                pos: zp,
+            });
             commands.entity(z_ent).despawn_recursive();
         }
     }
@@ -1011,8 +1589,119 @@ fn burn_tick_system(
     }
 }
 
-fn despawn_all_zombies(mut commands: Commands, q: Query<Entity, With<Zombie>>) {
+fn giant_toxic_attack(
+    time: Res<Time>,
+    mut commands: Commands,
+    assets: Res<ZombieAssets>,
+    mut giants: Query<(&Transform, &mut GiantAttack)>,
+    players: Query<(&Transform, &Player)>,
+) {
+    let dt = time.delta_seconds();
+    for (zt, mut attack) in &mut giants {
+        attack.cooldown -= dt;
+        if attack.cooldown > 0.0 {
+            continue;
+        }
+        let zp = zt.translation.truncate();
+        for (pt, player) in &players {
+            if player.hp <= 0 {
+                continue;
+            }
+            let pp = pt.translation.truncate();
+            if pp.distance(zp) < GIANT_ATTACK_RANGE {
+                attack.cooldown = GIANT_ATTACK_COOLDOWN;
+                commands.spawn((
+                    SpriteBundle {
+                        texture: assets.toxic_cloud.clone(),
+                        sprite: Sprite {
+                            custom_size: Some(Vec2::splat(TOXIC_CLOUD_RADIUS * 2.0)),
+                            color: Color::srgba(1.0, 1.0, 1.0, 0.7),
+                            ..default()
+                        },
+                        transform: Transform::from_xyz(pp.x, pp.y, 4.0),
+                        ..default()
+                    },
+                    ToxicCloud {
+                        lifetime: TOXIC_CLOUD_LIFETIME,
+                        tick: 0.0,
+                    },
+                ));
+                break;
+            }
+        }
+    }
+}
+
+fn toxic_cloud_tick(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut clouds: Query<(Entity, &Transform, &mut ToxicCloud, &mut Sprite)>,
+    players: Query<(Entity, &Transform, &Player)>,
+    mut dmg: EventWriter<PlayerDamagedEvent>,
+) {
+    let dt = time.delta_seconds();
+    for (entity, ct, mut cloud, mut sprite) in &mut clouds {
+        cloud.lifetime -= dt;
+        if cloud.lifetime <= 0.0 {
+            commands.entity(entity).despawn_recursive();
+            continue;
+        }
+        // Fade out
+        let alpha = (cloud.lifetime / TOXIC_CLOUD_LIFETIME).clamp(0.0, 0.7);
+        sprite.color = Color::srgba(1.0, 1.0, 1.0, alpha);
+
+        // Damage tick
+        cloud.tick += dt;
+        if cloud.tick >= 0.5 {
+            cloud.tick -= 0.5;
+            let cp = ct.translation.truncate();
+            for (_p_ent, pt, player) in &players {
+                if player.hp <= 0 {
+                    continue;
+                }
+                let pp = pt.translation.truncate();
+                if pp.distance(cp) < TOXIC_CLOUD_RADIUS {
+                    dmg.send(PlayerDamagedEvent {
+                        target_id: player.id,
+                        amount: (TOXIC_CLOUD_DPS * 0.5) as i32,
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn update_zombie_hp_bars(
+    zombies: Query<(&Zombie, &Children)>,
+    mut bars: Query<&mut Sprite, With<ZombieHpBar>>,
+) {
+    for (zombie, children) in &zombies {
+        if zombie.kind != ZombieKind::Giant {
+            continue;
+        }
+        let max_hp = zombie.kind.base_hp() as f32;
+        let pct = (zombie.hp as f32 / max_hp).clamp(0.0, 1.0);
+        for child in children.iter() {
+            if let Ok(mut sprite) = bars.get_mut(*child) {
+                sprite.custom_size = Some(Vec2::new(GIANT_HP_BAR_WIDTH * pct, 5.0));
+            }
+        }
+    }
+}
+
+fn despawn_all_zombies(
+    mut commands: Commands,
+    q: Query<Entity, With<Zombie>>,
+    clouds: Query<Entity, With<ToxicCloud>>,
+    stains: Query<Entity, With<BloodStain>>,
+) {
     for e in &q {
+        commands.entity(e).despawn_recursive();
+    }
+    for e in &clouds {
+        commands.entity(e).despawn_recursive();
+    }
+    for e in &stains {
         commands.entity(e).despawn_recursive();
     }
 }

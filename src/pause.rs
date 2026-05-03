@@ -28,17 +28,8 @@ fn pause_toggle_input(
     keys: Res<ButtonInput<KeyCode>>,
     current: Res<State<PauseState>>,
     mut next: ResMut<NextState<PauseState>>,
-    mut ctx: ResMut<NetContext>,
-    mut mode: ResMut<NetMode>,
-    mut next_game: ResMut<NextState<GameState>>,
 ) {
     if !keys.just_pressed(KeyCode::Escape) {
-        return;
-    }
-    if *mode != NetMode::SinglePlayer {
-        ctx.disconnect();
-        *mode = NetMode::SinglePlayer;
-        next_game.set(GameState::Menu);
         return;
     }
     match current.get() {
@@ -51,8 +42,14 @@ fn pause_menu_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut next_game: ResMut<NextState<GameState>>,
     mut next_pause: ResMut<NextState<PauseState>>,
+    mut ctx: ResMut<NetContext>,
+    mut mode: ResMut<NetMode>,
 ) {
     if keys.just_pressed(KeyCode::KeyQ) || keys.just_pressed(KeyCode::KeyM) {
+        if *mode != NetMode::SinglePlayer {
+            ctx.disconnect();
+            *mode = NetMode::SinglePlayer;
+        }
         next_game.set(GameState::Menu);
         next_pause.set(PauseState::Running);
     }
@@ -62,8 +59,9 @@ fn force_resume(mut next: ResMut<NextState<PauseState>>) {
     next.set(PauseState::Running);
 }
 
-fn spawn_pause_ui(mut commands: Commands, assets: Res<UiAssets>) {
+fn spawn_pause_ui(mut commands: Commands, assets: Res<UiAssets>, net: Res<NetMode>) {
     let font = assets.font.clone();
+    let is_multi = *net != NetMode::SinglePlayer;
     commands
         .spawn((
             NodeBundle {
@@ -77,7 +75,7 @@ fn spawn_pause_ui(mut commands: Commands, assets: Res<UiAssets>) {
                     row_gap: Val::Px(22.0),
                     ..default()
                 },
-                background_color: BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.7)),
+                background_color: BackgroundColor(Color::srgba(0.0, 0.0, 0.0, if is_multi { 0.5 } else { 0.7 })),
                 z_index: ZIndex::Global(100),
                 ..default()
             },
@@ -107,7 +105,7 @@ fn spawn_pause_ui(mut commands: Commands, assets: Res<UiAssets>) {
                 },
             ));
             parent.spawn(TextBundle::from_section(
-                "Q - main menu",
+                if is_multi { "Q - disconnect" } else { "Q - main menu" },
                 TextStyle {
                     font,
                     font_size: 18.0,

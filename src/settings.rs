@@ -1,5 +1,7 @@
 use bevy::prelude::*;
 use bevy::window::{PresentMode, PrimaryWindow, WindowMode};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 pub const RESOLUTIONS: [(u32, u32); 5] = [
@@ -10,35 +12,25 @@ pub const RESOLUTIONS: [(u32, u32); 5] = [
     (3840, 2160),
 ];
 
-pub const FPS_CAPS: [Option<u32>; 5] = [
+/// Selectable FPS caps in the settings menu.  Index 0 = UNLIMITED;
+/// remaining entries are sorted ascending so cycling left/right walks
+/// monotonically through the values.  `fps_limiter` enforces these.
+pub const FPS_CAPS: [Option<u32>; 10] = [
     None,
+    Some(30),
     Some(60),
     Some(120),
     Some(144),
-    Some(240),
+    Some(165),
+    Some(200),
+    Some(300),
+    Some(400),
+    Some(500),
 ];
 
 pub const QUALITY_LABELS: [&str; 4] = ["LOW", "MEDIUM", "HIGH", "ULTRA"];
 
-pub struct QualityPreset {
-    pub dirt: usize,
-    pub leaves: usize,
-    pub twigs: usize,
-    pub grass: usize,
-    pub bushes: usize,
-    pub trees: usize,
-    pub props: usize,
-    pub rain: usize,
-}
-
-pub const QUALITY_PRESETS: [QualityPreset; 4] = [
-    QualityPreset { dirt: 20, leaves: 60, twigs: 20, grass: 140, bushes: 30, trees: 100, props: 70, rain: 30 },
-    QualityPreset { dirt: 30, leaves: 100, twigs: 35, grass: 200, bushes: 45, trees: 160, props: 100, rain: 50 },
-    QualityPreset { dirt: 40, leaves: 160, twigs: 50, grass: 280, bushes: 60, trees: 210, props: 140, rain: 70 },
-    QualityPreset { dirt: 60, leaves: 240, twigs: 70, grass: 380, bushes: 80, trees: 280, props: 200, rain: 100 },
-];
-
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindowModeChoice {
     Windowed,
     Borderless,
@@ -69,7 +61,7 @@ impl WindowModeChoice {
     }
 }
 
-#[derive(Resource, Clone)]
+#[derive(Resource, Clone, Serialize, Deserialize)]
 pub struct GraphicsSettings {
     pub resolution_idx: usize,
     pub window_mode: WindowModeChoice,
@@ -78,6 +70,9 @@ pub struct GraphicsSettings {
     pub quality_idx: usize,
     pub show_fps: bool,
 }
+
+#[derive(Resource, Default)]
+pub struct SettingsLoadedFromDisk(pub bool);
 
 impl Default for GraphicsSettings {
     fn default() -> Self {
@@ -164,31 +159,93 @@ impl GraphicsSettings {
     pub fn show_fps_label(&self) -> &'static str {
         if self.show_fps { "ON" } else { "OFF" }
     }
-
-    pub fn quality_preset(&self) -> &'static QualityPreset {
-        &QUALITY_PRESETS[self.quality_idx]
-    }
 }
 
 pub struct SettingsPlugin;
 
 impl Plugin for SettingsPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<GraphicsSettings>()
-            .add_systems(Update, (detect_initial_resolution, apply_graphics_settings))
+        let (settings, loaded) = match load_settings() {
+            Some(s) => (s, true),
+            None => (GraphicsSettings::default(), false),
+        };
+        app.insert_resource(settings)
+            .insert_resource(SettingsLoadedFromDisk(loaded))
+            .add_systems(
+                Update,
+                (detect_initial_resolution, apply_graphics_settings, save_settings_on_change),
+            )
             .add_systems(Last, fps_limiter);
     }
+}
+
+fn settings_path() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    let base = std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join("Library/Application Support"));
+    #[cfg(target_os = "linux")]
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".config"))
+        });
+    #[cfg(target_os = "windows")]
+    let base = std::env::var("APPDATA").ok().map(PathBuf::from);
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let base: Option<PathBuf> = None;
+
+    base.map(|b| b.join("zombiegame2"))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("settings.json")
+}
+
+fn load_settings() -> Option<GraphicsSettings> {
+    let path = settings_path();
+    let data = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+fn save_settings(settings: &GraphicsSettings) {
+    let path = settings_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(data) = serde_json::to_string_pretty(settings) {
+        let _ = std::fs::write(&path, data);
+    }
+}
+
+fn save_settings_on_change(
+    settings: Res<GraphicsSettings>,
+    mut skip_first: Local<bool>,
+) {
+    if !settings.is_changed() {
+        return;
+    }
+    if !*skip_first {
+        *skip_first = true;
+        return;
+    }
+    save_settings(&settings);
 }
 
 fn detect_initial_resolution(
     mut settings: ResMut<GraphicsSettings>,
     windows: Query<&Window, With<PrimaryWindow>>,
+    loaded: Res<SettingsLoadedFromDisk>,
     mut ran: Local<bool>,
 ) {
     if *ran {
         return;
     }
     *ran = true;
+    if loaded.0 {
+        return;
+    }
     let Ok(window) = windows.get_single() else {
         return;
     };

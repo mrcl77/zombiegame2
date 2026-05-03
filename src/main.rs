@@ -1,8 +1,10 @@
 mod achievements;
 mod audio;
 mod bullet;
+mod elevator;
 mod lobby;
 mod map;
+mod map_data;
 mod menu;
 mod net;
 mod pause;
@@ -13,6 +15,7 @@ mod sync;
 mod ui;
 mod wave;
 mod weapon;
+mod world_consts;
 mod zombie;
 mod zones;
 
@@ -57,6 +60,14 @@ pub struct UiAssets {
 
 #[derive(Resource, Default)]
 pub struct Score(pub u32);
+
+/// Decaying screen shake.  Bumped by `accumulate_camera_shake` whenever an
+/// explosion fires near the camera; `camera_follow` then jitters the
+/// camera translation by `intensity` pixels each frame and decays it.
+#[derive(Resource, Default)]
+pub struct CameraShake {
+    pub intensity: f32,
+}
 
 pub fn gameplay_active(
     game: Res<State<GameState>>,
@@ -105,6 +116,7 @@ fn main() {
         .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.03)))
         .insert_resource(Time::<Fixed>::from_hz(TICK_HZ))
         .init_resource::<Score>()
+        .init_resource::<CameraShake>()
         .add_plugins((
             settings::SettingsPlugin,
             net::NetPlugin,
@@ -121,6 +133,7 @@ fn main() {
             weapon::WeaponPlugin,
             wave::WavePlugin,
             zones::ZonesPlugin,
+            elevator::ElevatorPlugin,
             achievements::AchievementsPlugin,
             audio::AudioFxPlugin,
             ui::UiPlugin,
@@ -128,7 +141,13 @@ fn main() {
         .add_systems(Startup, setup_camera)
         .add_systems(
             Update,
-            camera_follow.run_if(in_state(GameState::Playing)),
+            // Camera reads Transform after `interpolate_logical_pos` has
+            // lerped it between FixedUpdate ticks, so the world scrolls
+            // smoothly at any render FPS instead of stepping at 60 Hz.
+            (accumulate_camera_shake, camera_follow)
+                .chain()
+                .after(player::interpolate_logical_pos)
+                .run_if(in_state(GameState::Playing)),
         )
         .run();
 }
@@ -136,7 +155,28 @@ fn main() {
 fn setup_camera(mut commands: Commands) {
     let mut camera = Camera2dBundle::default();
     camera.projection.scaling_mode = ScalingMode::FixedVertical(FIXED_VIEW_H);
-    commands.spawn(camera);
+    // HDR is required for bloom: bright pixels overshoot 1.0 and the bloom
+    // pass picks them up.  Tonemapping then compresses the HDR back into
+    // SDR range so the image stays readable.
+    camera.camera.hdr = true;
+    camera.tonemapping = bevy::core_pipeline::tonemapping::Tonemapping::TonyMcMapface;
+    commands.spawn((
+        camera,
+        // Soft glow on muzzle flashes, explosions, lamps, tracers etc.
+        // The default settings are tuned for 3D, so we lean intensity down
+        // a touch and threshold up to avoid bloom on every bright pixel.
+        bevy::core_pipeline::bloom::BloomSettings {
+            intensity: 0.18,
+            low_frequency_boost: 0.5,
+            low_frequency_boost_curvature: 0.95,
+            high_pass_frequency: 1.0,
+            prefilter_settings: bevy::core_pipeline::bloom::BloomPrefilterSettings {
+                threshold: 0.6,
+                threshold_softness: 0.3,
+            },
+            composite_mode: bevy::core_pipeline::bloom::BloomCompositeMode::Additive,
+        },
+    ));
 }
 
 fn camera_follow(
@@ -144,6 +184,8 @@ fn camera_follow(
     ctx: Res<NetContext>,
     players: Query<(&Transform, &Player), Without<Camera>>,
     mut camera: Query<&mut Transform, With<Camera>>,
+    mut shake: ResMut<CameraShake>,
+    time: Res<Time>,
 ) {
     let Ok(window) = windows.get_single() else {
         return;
@@ -171,6 +213,52 @@ fn camera_follow(
     let max_x = (MAP_WIDTH / 2.0 - view_w / 2.0).max(0.0);
     let max_y = (MAP_HEIGHT / 2.0 - FIXED_VIEW_H / 2.0).max(0.0);
 
-    cam_transform.translation.x = target.x.clamp(-max_x, max_x);
-    cam_transform.translation.y = target.y.clamp(-max_y, max_y);
+    let base_x = target.x.clamp(-max_x, max_x);
+    let base_y = target.y.clamp(-max_y, max_y);
+
+    // Apply screen shake — random offset proportional to intensity.  Decay
+    // exponentially so big hits punch hard and fade smoothly.
+    let shake_amount = shake.intensity;
+    if shake_amount > 0.05 {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let ox = rng.gen_range(-shake_amount..shake_amount);
+        let oy = rng.gen_range(-shake_amount..shake_amount);
+        cam_transform.translation.x = base_x + ox;
+        cam_transform.translation.y = base_y + oy;
+    } else {
+        cam_transform.translation.x = base_x;
+        cam_transform.translation.y = base_y;
+    }
+    // Decay at ~6 units/sec exponential — feels snappy without lingering.
+    shake.intensity -= shake.intensity * 6.0 * time.delta_seconds();
+    shake.intensity = shake.intensity.max(0.0);
+}
+
+/// Reads explosion events and bumps the screen-shake intensity scaled by
+/// distance to the local player — close-range explosions punch the camera
+/// noticeably while far-away ones barely register.  Capped to keep things
+/// readable.
+fn accumulate_camera_shake(
+    mut shake: ResMut<CameraShake>,
+    mut events: EventReader<bullet::ExplodeEvent>,
+    ctx: Res<NetContext>,
+    players: Query<(&Transform, &Player)>,
+) {
+    let local_pos = players
+        .iter()
+        .find(|(_, p)| p.id == ctx.my_id)
+        .or_else(|| players.iter().next())
+        .map(|(t, _)| t.translation.truncate());
+    let Some(p) = local_pos else {
+        events.clear();
+        return;
+    };
+    for ev in events.read() {
+        let dist = ev.pos.distance(p);
+        // Audible-shake range: closer than 600 px gives meaningful kick.
+        let proximity = (1.0 - (dist / 600.0)).clamp(0.0, 1.0);
+        let bump = ev.radius * 0.12 * proximity;
+        shake.intensity = (shake.intensity + bump).min(28.0);
+    }
 }

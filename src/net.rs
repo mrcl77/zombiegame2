@@ -15,9 +15,28 @@ pub const MAX_MSG_SIZE: usize = 1_048_576;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ClientMsg {
-    Hello,
+    Hello { nickname: String },
     Input(NetInput),
     Leave,
+}
+
+pub const NICKNAME_MAX_LEN: usize = 10;
+/// Sanitises a free-form nickname: trims whitespace, uppercases, restricts
+/// to printable ASCII, caps to NICKNAME_MAX_LEN.  Empty input → "GRACZ".
+pub fn sanitize_nickname(input: &str) -> String {
+    let mut out = String::with_capacity(NICKNAME_MAX_LEN);
+    for c in input.chars() {
+        if out.chars().count() >= NICKNAME_MAX_LEN {
+            break;
+        }
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_uppercase());
+        }
+    }
+    if out.is_empty() {
+        out.push_str("GRACZ");
+    }
+    out
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -39,6 +58,9 @@ pub struct NetInput {
     pub throw: bool,
     pub reload: bool,
     pub switch_slot: u8,
+    /// True for the single tick when the player presses the interact key (E)
+    /// — used by the segment-unlock system to detect a manual purchase.
+    pub interact: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -55,6 +77,11 @@ pub struct NetSnapshot {
     pub break_secs: f32,
     pub zombies_to_spawn: u32,
     pub game_over: bool,
+    /// Bitmask: bit `i` set ⇒ map segment with idx `i` is unlocked.
+    /// Bit 0 (starting area) is always 1.
+    pub unlocked_segments_mask: u8,
+    /// Player id → nickname.  Sparse map — only joined players included.
+    pub player_nicknames: Vec<(u8, String)>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
@@ -64,7 +91,9 @@ pub struct NetPlayerState {
     pub y: f32,
     pub rot: f32,
     pub hp: i32,
-    pub weapon: u8,
+    pub armor: i32,
+    pub active_slot: u8,
+    pub slot1_weapon: u8, // 255 = None
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
@@ -112,6 +141,7 @@ pub enum NetMode {
 
 pub enum ServerEvent {
     Connected { id: u8 },
+    Hello { id: u8, nickname: String },
     Disconnected { id: u8 },
     Input { id: u8, input: NetInput },
 }
@@ -191,6 +221,21 @@ pub struct LocalInput(pub NetInput);
 
 #[derive(Resource, Default)]
 pub struct RemoteInputs(pub HashMap<u8, NetInput>);
+
+#[derive(Resource)]
+pub struct LocalNickname(pub String);
+
+impl Default for LocalNickname {
+    fn default() -> Self {
+        Self("GRACZ".to_string())
+    }
+}
+
+/// Map of `player_id → nickname`.  Server populates from `Hello` messages
+/// (and writes its own from `LocalNickname`); client populates from
+/// `NetSnapshot.player_nicknames`.
+#[derive(Resource, Default)]
+pub struct PlayerNicknames(pub HashMap<u8, String>);
 
 #[derive(Resource, Default)]
 pub struct NetEntities {
@@ -319,7 +364,11 @@ pub fn start_host() -> std::io::Result<HostConn> {
                             break;
                         }
                     }
-                    Ok(ClientMsg::Hello) => {}
+                    Ok(ClientMsg::Hello { nickname }) => {
+                        let clean = sanitize_nickname(&nickname);
+                        let _ = reader_event_tx
+                            .send(ServerEvent::Hello { id, nickname: clean });
+                    }
                     Ok(ClientMsg::Leave) => {
                         reader_senders.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
                         let _ = reader_event_tx.send(ServerEvent::Disconnected { id });
@@ -342,7 +391,7 @@ pub fn start_host() -> std::io::Result<HostConn> {
     })
 }
 
-pub fn start_client(addr: SocketAddr) -> std::io::Result<ClientConn> {
+pub fn start_client(addr: SocketAddr, nickname: &str) -> std::io::Result<ClientConn> {
     let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))?;
     stream.set_nodelay(true)?;
 
@@ -350,7 +399,13 @@ pub fn start_client(addr: SocketAddr) -> std::io::Result<ClientConn> {
     let (send_tx, send_rx) = channel::<ClientMsg>();
 
     let mut hello_stream = stream.try_clone()?;
-    write_msg(&mut hello_stream, &ClientMsg::Hello)?;
+    let clean_nick = sanitize_nickname(nickname);
+    write_msg(
+        &mut hello_stream,
+        &ClientMsg::Hello {
+            nickname: clean_nick,
+        },
+    )?;
 
     let mut writer_stream = stream.try_clone()?;
     thread::spawn(move || {
@@ -436,6 +491,8 @@ impl Plugin for NetPlugin {
             .init_resource::<NetContext>()
             .init_resource::<LocalInput>()
             .init_resource::<RemoteInputs>()
-            .init_resource::<NetEntities>();
+            .init_resource::<NetEntities>()
+            .init_resource::<LocalNickname>()
+            .init_resource::<PlayerNicknames>();
     }
 }

@@ -1,12 +1,14 @@
 use bevy::prelude::*;
 
 use crate::audio::SfxEvent;
-use crate::map::MapObstacles;
+use crate::map::{Explodable, ExplodableObstacleIdx, MapObstacles, ObstacleShape};
 use crate::net::{is_authoritative, NetContext, NetEntities, NetId};
 use crate::pixelart::{Canvas, Rgba};
 use crate::player::{Player, PlayerDamagedEvent, PLAYER_RADIUS};
 use crate::weapon::ThrowableKind;
-use crate::zombie::{Zombie, ZombieKilledEvent, ZombieKind};
+use crate::zombie::{
+    DamageNumberEvent, Zombie, ZombieKilledEvent, ZombieKind, ZOMBIE_HIT_FLASH_DURATION,
+};
 use crate::{gameplay_active, GameState, Score};
 
 const BULLET_SPRITE_SIZE: Vec2 = Vec2::new(14.0, 6.0);
@@ -15,6 +17,7 @@ const ROCKET_SPRITE_SIZE: Vec2 = Vec2::new(26.0, 12.0);
 pub const BULLET_RADIUS: f32 = 3.0;
 pub const BULLET_LIFETIME: f32 = 1.4;
 pub const ROCKET_LIFETIME: f32 = 2.2;
+pub const FLAME_LIFETIME: f32 = 0.42;
 pub const EXPLOSION_LIFETIME: f32 = 0.38;
 
 pub const ROCKET_EXPLOSION_RADIUS: f32 = 95.0;
@@ -31,6 +34,14 @@ pub struct Bullet {
     pub lifetime: f32,
     pub damage: i32,
     pub is_rocket: bool,
+    /// If true, the bullet steers toward `target` while it has line-of-sight.
+    pub homing: bool,
+    pub target: Option<Entity>,
+    /// True for flamethrower puffs.  Renders as a flame sprite that grows
+    /// and fades over its short lifetime.  Damage still applies.
+    pub is_flame: bool,
+    /// Original lifetime, kept for the flame fade-out alpha curve.
+    pub initial_lifetime: f32,
 }
 
 #[derive(Component)]
@@ -46,6 +57,8 @@ pub struct ShootEvent {
     pub damage: i32,
     pub speed: f32,
     pub is_rocket: bool,
+    pub homing: bool,
+    pub is_flame: bool,
 }
 
 #[derive(Event, Clone, Copy)]
@@ -97,12 +110,86 @@ pub const THROW_RANGE: f32 = 300.0;
 #[derive(Component)]
 pub struct ThrowIndicator;
 
+/// Cosmetic muzzle flash spawned at the gun tip on every shot.  Fades out
+/// over `max_lifetime` seconds.
+#[derive(Component)]
+pub struct MuzzleFlash {
+    pub lifetime: f32,
+    pub max_lifetime: f32,
+}
+
+/// Tiny impact spark thrown off when a bullet hits a wall — a small
+/// translating, fading sprite with no gameplay effect.
+#[derive(Component)]
+pub struct ImpactSpark {
+    pub velocity: Vec2,
+    pub lifetime: f32,
+    pub max_lifetime: f32,
+}
+
+/// Expanding ring drawn over the explosion sprite for extra punch.  Grows
+/// from 0 to `max_radius` while alpha fades.
+#[derive(Component)]
+pub struct ShockwaveRing {
+    pub lifetime: f32,
+    pub max_lifetime: f32,
+    pub max_radius: f32,
+}
+
+/// Smoke puff drifting upward — used for the smoke columns that linger over
+/// destroyed wrecks and barrels.  Grows + fades over its lifetime.
+#[derive(Component)]
+pub struct SmokePuff {
+    pub lifetime: f32,
+    pub max_lifetime: f32,
+    pub velocity: Vec2,
+    pub start_size: f32,
+    pub end_size: f32,
+}
+
+/// Short bullet tracer streak.  Fades in ~0.18 s — purely cosmetic, drawn
+/// over the bullet path so the firing line reads even at high RPM.
+#[derive(Component)]
+pub struct BulletTracer {
+    pub lifetime: f32,
+    pub max_lifetime: f32,
+}
+
+/// Spent brass casing ejected on every shot.  Flies sideways with spin,
+/// decelerates, then sits on the ground as a faint decal for ~5 s.
+#[derive(Component)]
+pub struct BulletShell {
+    pub velocity: Vec2,
+    pub spin: f32,
+    pub lifetime: f32,
+    pub max_lifetime: f32,
+}
+
+/// Ambient ember / drifting ash particle that rises slowly through the
+/// world to sell the post-apocalyptic mood.  Spawned periodically around
+/// the camera; despawned on lifetime expiry.
+#[derive(Component)]
+pub struct AmbientEmber {
+    pub velocity: Vec2,
+    pub lifetime: f32,
+    pub max_lifetime: f32,
+    pub flicker: f32,
+}
+
 #[derive(Resource)]
 pub struct BulletAssets {
     pub bullet: Handle<Image>,
     pub rocket: Handle<Image>,
     pub explosion: Handle<Image>,
     pub thrown: Handle<Image>,
+    pub muzzle_flash: Handle<Image>,
+    pub spark: Handle<Image>,
+    pub shockwave: Handle<Image>,
+    pub flame: Handle<Image>,
+    pub smoke: Handle<Image>,
+    pub tracer: Handle<Image>,
+    pub shell: Handle<Image>,
+    pub ember: Handle<Image>,
 }
 
 pub struct BulletPlugin;
@@ -116,7 +203,18 @@ impl Plugin for BulletPlugin {
             .add_systems(OnExit(GameState::Playing), despawn_all_bullets)
             .add_systems(
                 Update,
-                update_throw_indicator.run_if(in_state(GameState::Playing)),
+                (
+                    update_throw_indicator,
+                    update_muzzle_flashes,
+                    update_impact_sparks,
+                    update_shockwaves,
+                    update_smoke_puffs,
+                    update_bullet_tracers,
+                    update_bullet_shells,
+                    spawn_ambient_embers,
+                    update_ambient_embers,
+                )
+                    .run_if(in_state(GameState::Playing)),
             )
             .add_systems(
                 FixedUpdate,
@@ -145,6 +243,14 @@ fn setup_bullet_assets(mut commands: Commands, mut images: ResMut<Assets<Image>>
         rocket: images.add(build_rocket_image()),
         explosion: images.add(build_explosion_image()),
         thrown: images.add(build_thrown_image()),
+        muzzle_flash: images.add(build_muzzle_flash_image()),
+        spark: images.add(build_spark_image()),
+        shockwave: images.add(build_shockwave_image()),
+        flame: images.add(build_flame_puff_image()),
+        smoke: images.add(build_smoke_puff_image()),
+        tracer: images.add(build_tracer_image()),
+        shell: images.add(build_shell_image()),
+        ember: images.add(build_ember_image()),
     });
     commands.spawn((
         SpriteBundle {
@@ -309,12 +415,33 @@ pub fn spawn_bullet_entity(
     damage: i32,
     net_id: u32,
     is_rocket: bool,
+    homing: bool,
+    target: Option<Entity>,
+    is_flame: bool,
 ) -> Entity {
     let angle = direction.y.atan2(direction.x);
-    let (texture, size, lifetime) = if is_rocket {
+    let (texture, size, lifetime) = if is_flame {
+        (
+            assets.flame.clone(),
+            Vec2::new(28.0, 22.0),
+            FLAME_LIFETIME,
+        )
+    } else if is_rocket {
         (assets.rocket.clone(), ROCKET_SPRITE_SIZE, ROCKET_LIFETIME)
     } else {
         (assets.bullet.clone(), BULLET_SPRITE_SIZE, BULLET_LIFETIME)
+    };
+    let color = if is_flame {
+        // Slight per-puff color jitter so the cone reads as living flame
+        // rather than copies of the same sprite.  Pure-orange biased.
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let r = 1.0;
+        let g = rng.gen_range(0.55..0.85);
+        let b = rng.gen_range(0.10..0.25);
+        Color::srgba(r, g, b, 1.0)
+    } else {
+        Color::WHITE
     };
     commands
         .spawn((
@@ -322,6 +449,7 @@ pub fn spawn_bullet_entity(
                 texture,
                 sprite: Sprite {
                     custom_size: Some(size),
+                    color,
                     ..default()
                 },
                 transform: Transform::from_xyz(origin.x, origin.y, 8.0)
@@ -333,6 +461,10 @@ pub fn spawn_bullet_entity(
                 lifetime,
                 damage,
                 is_rocket,
+                homing,
+                target,
+                is_flame,
+                initial_lifetime: lifetime,
             },
             NetId(net_id),
         ))
@@ -371,9 +503,19 @@ fn shoot_listener(
     mut events: EventReader<ShootEvent>,
     assets: Res<BulletAssets>,
     mut ctx: ResMut<NetContext>,
+    zombies: Query<(Entity, &Transform), With<Zombie>>,
 ) {
     for ev in events.read() {
         let net_id = ctx.alloc_bullet_id();
+        // For homing rockets, lock the closest zombie at fire time so the
+        // missile commits to a single target.  We pick the nearest in the
+        // forward 120° cone, falling back to the absolute nearest if no
+        // zombie sits in front.
+        let target = if ev.homing {
+            find_homing_target(&zombies, ev.origin, ev.direction)
+        } else {
+            None
+        };
         spawn_bullet_entity(
             &mut commands,
             &assets,
@@ -383,23 +525,171 @@ fn shoot_listener(
             ev.damage,
             net_id,
             ev.is_rocket,
+            ev.homing,
+            target,
+            ev.is_flame,
         );
+        // Cheap glowing tracer streak from origin in the direction of fire.
+        // Skipped for rockets and flames (they have their own bigger
+        // visuals).
+        if !ev.is_rocket && !ev.is_flame {
+            spawn_bullet_tracer(&mut commands, &assets, ev.origin, ev.direction);
+            spawn_bullet_shell(&mut commands, &assets, ev.origin, ev.direction);
+        }
+
+        // Cosmetic muzzle flash at the gun tip.  Skip for flamethrower
+        // since the flame puffs themselves are the visual.  Bigger for
+        // rockets so the launch reads correctly even from a distance.
+        if ev.is_flame {
+            continue;
+        }
+        let angle = ev.direction.y.atan2(ev.direction.x);
+        let flash_size = if ev.is_rocket {
+            Vec2::new(40.0, 30.0)
+        } else {
+            Vec2::new(28.0, 20.0)
+        };
+        commands.spawn((
+            SpriteBundle {
+                texture: assets.muzzle_flash.clone(),
+                sprite: Sprite {
+                    custom_size: Some(flash_size),
+                    color: Color::srgba(1.0, 0.95, 0.55, 1.0),
+                    ..default()
+                },
+                transform: Transform::from_xyz(ev.origin.x, ev.origin.y, 9.4)
+                    .with_rotation(Quat::from_rotation_z(angle)),
+                ..default()
+            },
+            MuzzleFlash {
+                lifetime: 0.07,
+                max_lifetime: 0.07,
+            },
+        ));
     }
 }
 
+/// Pick the nearest live zombie roughly in front of the launcher.  Cosine
+/// over 0.5 ≈ within 60° on either side of `aim`.  If nothing sits in the
+/// cone, fall back to the nearest zombie anywhere — better to track
+/// something than fly straight past a wall of enemies.
+fn find_homing_target(
+    zombies: &Query<(Entity, &Transform), With<Zombie>>,
+    origin: Vec2,
+    aim: Vec2,
+) -> Option<Entity> {
+    let mut best_in_cone: Option<(Entity, f32)> = None;
+    let mut best_any: Option<(Entity, f32)> = None;
+    let aim = if aim.length_squared() > 0.0 { aim.normalize() } else { Vec2::X };
+    const MAX_RANGE_SQ: f32 = 1400.0 * 1400.0;
+    for (ent, t) in zombies.iter() {
+        let p = t.translation.truncate();
+        let delta = p - origin;
+        let dist_sq = delta.length_squared();
+        if !(1.0..=MAX_RANGE_SQ).contains(&dist_sq) {
+            continue;
+        }
+        if best_any.map(|(_, d)| dist_sq < d).unwrap_or(true) {
+            best_any = Some((ent, dist_sq));
+        }
+        let dir = delta / dist_sq.sqrt();
+        if dir.dot(aim) >= 0.5
+            && best_in_cone.map(|(_, d)| dist_sq < d).unwrap_or(true)
+        {
+            best_in_cone = Some((ent, dist_sq));
+        }
+    }
+    best_in_cone.or(best_any).map(|(e, _)| e)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn bullet_movement(
     mut commands: Commands,
     time: Res<Time>,
     obstacles: Res<MapObstacles>,
-    mut q: Query<(Entity, &mut Transform, &mut Bullet)>,
+    assets: Res<BulletAssets>,
+    targets: Query<&Transform, (With<Zombie>, Without<Bullet>)>,
+    explodables: Query<(&Transform, &Explodable), Without<Bullet>>,
+    mut q: Query<(Entity, &mut Transform, &mut Bullet, &mut Sprite)>,
     mut explode: EventWriter<ExplodeEvent>,
 ) {
     let dt = time.delta_seconds();
-    for (entity, mut transform, mut bullet) in &mut q {
+    const HOMING_TURN_RATE: f32 = 6.0; // radians/sec
+    for (entity, mut transform, mut bullet, mut sprite) in &mut q {
+        // Homing steering — lerp velocity direction toward the target each
+        // tick.  Speed is preserved; only the heading changes.  If the
+        // target died (entity gone), fall through to straight-line flight.
+        if bullet.homing {
+            if let Some(target_ent) = bullet.target {
+                if let Ok(target_t) = targets.get(target_ent) {
+                    let pos = transform.translation.truncate();
+                    let to_target = target_t.translation.truncate() - pos;
+                    if to_target.length_squared() > 1.0 {
+                        let speed = bullet.velocity.length().max(1.0);
+                        let want = to_target.normalize();
+                        let cur = bullet.velocity / speed;
+                        // Quat slerp would work, but for 2D it's cheaper to
+                        // rotate `cur` toward `want` by a clamped angle.
+                        let cur_a = cur.y.atan2(cur.x);
+                        let want_a = want.y.atan2(want.x);
+                        let mut delta = want_a - cur_a;
+                        while delta > std::f32::consts::PI {
+                            delta -= std::f32::consts::TAU;
+                        }
+                        while delta < -std::f32::consts::PI {
+                            delta += std::f32::consts::TAU;
+                        }
+                        let max_step = HOMING_TURN_RATE * dt;
+                        let step = delta.clamp(-max_step, max_step);
+                        let new_a = cur_a + step;
+                        let new_dir = Vec2::new(new_a.cos(), new_a.sin());
+                        bullet.velocity = new_dir * speed;
+                        transform.rotation = Quat::from_rotation_z(new_a);
+                    }
+                } else {
+                    // Target gone — drop the lock and fly straight.
+                    bullet.target = None;
+                }
+            }
+        }
         transform.translation += (bullet.velocity * dt).extend(0.0);
         bullet.lifetime -= dt;
+
+        // Flame puffs grow + fade as they travel — flamethrower visual.
+        // Also slow them down so they "drift" near the end of their
+        // lifetime instead of zipping in a straight line.
+        if bullet.is_flame {
+            let pct = (bullet.lifetime / bullet.initial_lifetime).clamp(0.0, 1.0);
+            let progress = 1.0 - pct;
+            let scale = 0.6 + progress * 1.6; // 0.6 → 2.2x size
+            sprite.custom_size = Some(Vec2::new(28.0 * scale, 22.0 * scale));
+            // Quadratic alpha falloff so the tail of the puff disappears
+            // smoothly instead of clipping out.
+            sprite.color.set_alpha(pct.powf(1.4));
+            // Drag — flames slow down as they spread.
+            bullet.velocity *= 1.0 - 1.6 * dt;
+        }
+
         let pos = transform.translation.truncate();
         let hit_obstacle = obstacles.hits(pos, BULLET_RADIUS);
+        // Explodables are registered in `MapObstacles` so movement still
+        // routes around them — but a bullet hitting one shouldn't be eaten
+        // silently by the obstacle check.  If the bullet is overlapping a
+        // live explodable's rect, skip the despawn here and let
+        // `bullet_collision` apply damage on this same tick.
+        let on_explodable = hit_obstacle
+            && explodables.iter().any(|(t, expl)| {
+                if expl.hp <= 0 {
+                    return false;
+                }
+                let ep = t.translation.truncate();
+                let half = expl.kind.collision_half();
+                (pos.x - ep.x).abs() < half.x + BULLET_RADIUS + 2.0
+                    && (pos.y - ep.y).abs() < half.y + BULLET_RADIUS + 2.0
+            });
+        if on_explodable {
+            continue;
+        }
         if bullet.lifetime <= 0.0 || hit_obstacle {
             if bullet.is_rocket {
                 explode.send(ExplodeEvent {
@@ -408,23 +698,81 @@ fn bullet_movement(
                     zombie_damage: ROCKET_EXPLOSION_ZOMBIE_DAMAGE,
                     player_damage: ROCKET_EXPLOSION_PLAYER_DAMAGE,
                 });
+            } else if hit_obstacle && !bullet.is_flame {
+                // Spawn 3 small impact sparks bouncing off the wall in
+                // random directions — non-rocket bullets only, so rocket
+                // explosions don't compete with the sparks visually.
+                // Flame puffs already have their own dissipation visual,
+                // so they skip the sparks.
+                spawn_impact_sparks(&mut commands, &assets, pos, bullet.velocity);
             }
             commands.entity(entity).despawn_recursive();
         }
     }
 }
 
+fn spawn_impact_sparks(
+    commands: &mut Commands,
+    assets: &BulletAssets,
+    pos: Vec2,
+    incoming_velocity: Vec2,
+) {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    // Reflect-ish: sparks fly back generally opposite the bullet, with a
+    // wide cone of randomisation so the burst feels fizzy, not directional.
+    let base = if incoming_velocity.length_squared() > 0.0001 {
+        -incoming_velocity.normalize()
+    } else {
+        Vec2::Y
+    };
+    for _ in 0..4 {
+        let angle: f32 = rng.gen_range(-1.4..1.4);
+        let (sin, cos) = angle.sin_cos();
+        let dir = Vec2::new(base.x * cos - base.y * sin, base.x * sin + base.y * cos);
+        let speed = rng.gen_range(120.0..240.0);
+        let life = rng.gen_range(0.18..0.32);
+        commands.spawn((
+            SpriteBundle {
+                texture: assets.spark.clone(),
+                sprite: Sprite {
+                    custom_size: Some(Vec2::splat(rng.gen_range(4.0..7.0))),
+                    color: Color::srgba(1.0, 0.95, 0.55, 1.0),
+                    ..default()
+                },
+                transform: Transform::from_xyz(pos.x, pos.y, 8.5),
+                ..default()
+            },
+            ImpactSpark {
+                velocity: dir * speed,
+                lifetime: life,
+                max_lifetime: life,
+            },
+        ));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn bullet_collision(
     mut commands: Commands,
+    assets: Res<BulletAssets>,
     bullets: Query<(Entity, &Transform, &Bullet)>,
     mut zombies: Query<(Entity, &Transform, &mut Zombie)>,
+    mut explodables: Query<(Entity, &Transform, &mut Explodable, &ExplodableObstacleIdx)>,
+    mut obstacles: ResMut<MapObstacles>,
+    players: Query<&Player>,
     mut killed: EventWriter<ZombieKilledEvent>,
     mut explode: EventWriter<ExplodeEvent>,
+    mut dmg_numbers: EventWriter<DamageNumberEvent>,
     mut sfx: EventWriter<SfxEvent>,
     mut score: ResMut<Score>,
 ) {
+    let mult = max_money_mult(&players);
     for (b_entity, b_transform, bullet) in &bullets {
         let bp = b_transform.translation.truncate();
+        let mut consumed = false;
+
+        // Zombies first — they're the primary target.
         for (z_entity, z_transform, mut zombie) in &mut zombies {
             if zombie.hp <= 0 {
                 continue;
@@ -439,17 +787,27 @@ fn bullet_collision(
                         player_damage: ROCKET_EXPLOSION_PLAYER_DAMAGE,
                     });
                     commands.entity(b_entity).despawn_recursive();
+                    consumed = true;
                     break;
                 }
                 zombie.hp -= bullet.damage;
+                zombie.hit_flash = ZOMBIE_HIT_FLASH_DURATION;
+                dmg_numbers.send(DamageNumberEvent {
+                    pos: zp,
+                    amount: bullet.damage,
+                });
                 commands.entity(b_entity).despawn_recursive();
                 sfx.send(SfxEvent::Hit);
                 if zombie.hp <= 0 {
                     let z_kind = zombie.kind;
                     let was_exploder = matches!(z_kind, ZombieKind::Exploder);
                     commands.entity(z_entity).despawn_recursive();
-                    killed.send(ZombieKilledEvent { kind: z_kind, by_explosion: false });
-                    score.0 += 20;
+                    killed.send(ZombieKilledEvent {
+                        kind: z_kind,
+                        by_explosion: false,
+                        pos: zp,
+                    });
+                    score.0 += z_kind.kill_reward() * mult as u32;
                     sfx.send(SfxEvent::ZombieDeath);
                     if was_exploder {
                         explode.send(ExplodeEvent {
@@ -460,9 +818,61 @@ fn bullet_collision(
                         });
                     }
                 }
+                consumed = true;
                 break;
             }
         }
+        if consumed {
+            continue;
+        }
+
+        // Then explodable props (cars, fuel barrels).  Bullets always
+        // consume on hit; rockets that hit a wreck go straight to a chain
+        // explosion (skip the prop's own HP roll).
+        for (e_entity, e_transform, mut expl, obs_idx) in &mut explodables {
+            if expl.hp <= 0 {
+                continue;
+            }
+            let ep = e_transform.translation.truncate();
+            // Use the prop's collision half + bullet radius for hit-test
+            // (so big wrecks are easy to plink, small barrels still feel
+            // accurate).
+            let half = expl.kind.collision_half();
+            let dx = (bp.x - ep.x).abs();
+            let dy = (bp.y - ep.y).abs();
+            if dx < half.x + BULLET_RADIUS && dy < half.y + BULLET_RADIUS {
+                if bullet.is_rocket {
+                    explode.send(ExplodeEvent {
+                        pos: bp,
+                        radius: ROCKET_EXPLOSION_RADIUS,
+                        zombie_damage: ROCKET_EXPLOSION_ZOMBIE_DAMAGE,
+                        player_damage: ROCKET_EXPLOSION_PLAYER_DAMAGE,
+                    });
+                    commands.entity(b_entity).despawn_recursive();
+                    consumed = true;
+                    break;
+                }
+                expl.hp -= bullet.damage;
+                commands.entity(b_entity).despawn_recursive();
+                sfx.send(SfxEvent::Hit);
+                if expl.hp <= 0 {
+                    if let Some(o) = obstacles.list.get_mut(obs_idx.0) {
+                        o.shape = ObstacleShape::Circle(0.0);
+                    }
+                    explode.send(ExplodeEvent {
+                        pos: ep,
+                        radius: expl.radius,
+                        zombie_damage: expl.zombie_damage,
+                        player_damage: expl.player_damage,
+                    });
+                    spawn_smoke_column(&mut commands, &assets, ep);
+                    commands.entity(e_entity).despawn_recursive();
+                }
+                consumed = true;
+                break;
+            }
+        }
+        let _ = consumed;
     }
 }
 
@@ -472,14 +882,18 @@ fn explode_listener(
     assets: Res<BulletAssets>,
     mut events: EventReader<ExplodeEvent>,
     mut zombies: Query<(Entity, &Transform, &mut Zombie)>,
+    mut explodables: Query<(Entity, &Transform, &mut Explodable, &ExplodableObstacleIdx)>,
+    mut obstacles: ResMut<MapObstacles>,
     players: Query<(&Transform, &Player)>,
     mut damage_evw: EventWriter<PlayerDamagedEvent>,
     mut killed_evw: EventWriter<ZombieKilledEvent>,
+    mut dmg_numbers: EventWriter<DamageNumberEvent>,
     mut sfx: EventWriter<SfxEvent>,
     mut score: ResMut<Score>,
     mut ctx: ResMut<NetContext>,
     mut net_entities: ResMut<NetEntities>,
 ) {
+    let mult = max_money_mult_from_tp(&players);
     let mut queue: Vec<ExplodeEvent> = events.read().copied().collect();
     while let Some(ev) = queue.pop() {
         for (z_ent, z_t, mut zombie) in &mut zombies {
@@ -489,12 +903,21 @@ fn explode_listener(
             let zp = z_t.translation.truncate();
             if zp.distance(ev.pos) < ev.radius + zombie.kind.radius() {
                 zombie.hp -= ev.zombie_damage;
+                zombie.hit_flash = ZOMBIE_HIT_FLASH_DURATION;
+                dmg_numbers.send(DamageNumberEvent {
+                    pos: zp,
+                    amount: ev.zombie_damage,
+                });
                 if zombie.hp <= 0 {
                     let z_kind = zombie.kind;
                     let was_exploder = matches!(z_kind, ZombieKind::Exploder);
                     commands.entity(z_ent).despawn_recursive();
-                    killed_evw.send(ZombieKilledEvent { kind: z_kind, by_explosion: true });
-                    score.0 += 20;
+                    killed_evw.send(ZombieKilledEvent {
+                        kind: z_kind,
+                        by_explosion: true,
+                        pos: zp,
+                    });
+                    score.0 += z_kind.kill_reward() * mult as u32;
                     if was_exploder {
                         queue.push(ExplodeEvent {
                             pos: zp,
@@ -503,6 +926,32 @@ fn explode_listener(
                             player_damage: EXPLODER_EXPLOSION_PLAYER_DAMAGE,
                         });
                     }
+                }
+            }
+        }
+        // Chain explosions through nearby explodables (cars, barrels).
+        // Apply ev's zombie_damage to their HP — that lets ordinary grenades
+        // weaken a wreck without instantly detonating it, while a rocket's
+        // big damage still chains as expected.
+        for (e_ent, e_t, mut expl, obs_idx) in &mut explodables {
+            if expl.hp <= 0 {
+                continue;
+            }
+            let ep = e_t.translation.truncate();
+            if ep.distance(ev.pos) < ev.radius + 16.0 {
+                expl.hp -= ev.zombie_damage.max(8);
+                if expl.hp <= 0 {
+                    if let Some(o) = obstacles.list.get_mut(obs_idx.0) {
+                        o.shape = ObstacleShape::Circle(0.0);
+                    }
+                    queue.push(ExplodeEvent {
+                        pos: ep,
+                        radius: expl.radius,
+                        zombie_damage: expl.zombie_damage,
+                        player_damage: expl.player_damage,
+                    });
+                    spawn_smoke_column(&mut commands, &assets, ep);
+                    commands.entity(e_ent).despawn_recursive();
                 }
             }
         }
@@ -521,6 +970,27 @@ fn explode_listener(
         let net_id = ctx.alloc_explosion_id();
         let ent = spawn_explosion_entity(&mut commands, &assets, ev.pos, ev.radius, net_id);
         net_entities.explosions.insert(net_id, ent);
+        // Cosmetic shockwave ring — purely client-side flair on top of the
+        // explosion sprite.  Not synced; both host and clients spawn one
+        // independently when they receive the explosion.
+        let shock_life = 0.4;
+        commands.spawn((
+            SpriteBundle {
+                texture: assets.shockwave.clone(),
+                sprite: Sprite {
+                    custom_size: Some(Vec2::splat(ev.radius * 0.4)),
+                    color: Color::srgba(1.0, 0.85, 0.5, 0.9),
+                    ..default()
+                },
+                transform: Transform::from_xyz(ev.pos.x, ev.pos.y, 9.6),
+                ..default()
+            },
+            ShockwaveRing {
+                lifetime: shock_life,
+                max_lifetime: shock_life,
+                max_radius: ev.radius * 2.6,
+            },
+        ));
         sfx.send(SfxEvent::Explosion);
     }
 }
@@ -671,10 +1141,12 @@ fn fire_pool_update(
     time: Res<Time>,
     mut fires: Query<(Entity, &mut FirePool, &Transform)>,
     mut zombies: Query<(Entity, &Transform, &mut Zombie), Without<FirePool>>,
+    players: Query<&Player>,
     mut killed: EventWriter<ZombieKilledEvent>,
     mut score: ResMut<Score>,
 ) {
     let dt = time.delta_seconds();
+    let mult = max_money_mult(&players);
     for (entity, mut fire, fire_t) in &mut fires {
         fire.lifetime -= dt;
         if fire.lifetime <= 0.0 {
@@ -694,14 +1166,16 @@ fn fire_pool_update(
             let zp = zt.translation.truncate();
             if zp.distance(fp) < fire.radius + zombie.kind.radius() {
                 zombie.hp -= FIRE_DAMAGE;
+                zombie.hit_flash = ZOMBIE_HIT_FLASH_DURATION;
                 if zombie.hp <= 0 {
                     let z_kind = zombie.kind;
                     commands.entity(z_ent).despawn_recursive();
                     killed.send(ZombieKilledEvent {
                         kind: z_kind,
                         by_explosion: true,
+                        pos: zp,
                     });
-                    score.0 += 20;
+                    score.0 += z_kind.kill_reward() * mult as u32;
                 }
             }
         }
@@ -766,6 +1240,13 @@ fn despawn_all_bullets(
             With<ThrownProjectile>,
             With<SmokeCloud>,
             With<FirePool>,
+            With<MuzzleFlash>,
+            With<ImpactSpark>,
+            With<ShockwaveRing>,
+            With<SmokePuff>,
+            With<BulletTracer>,
+            With<BulletShell>,
+            With<AmbientEmber>,
         )>,
     >,
     mut net_entities: ResMut<NetEntities>,
@@ -774,4 +1255,596 @@ fn despawn_all_bullets(
         commands.entity(e).despawn_recursive();
     }
     net_entities.explosions.clear();
+}
+
+fn max_money_mult(players: &Query<&Player>) -> u8 {
+    players.iter().map(|p| p.money_mult).max().unwrap_or(1).max(1)
+}
+
+fn max_money_mult_from_tp(players: &Query<(&Transform, &Player)>) -> u8 {
+    players.iter().map(|(_, p)| p.money_mult).max().unwrap_or(1).max(1)
+}
+
+// ── FX update systems ─────────────────────────────────────────────────
+
+fn update_muzzle_flashes(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut q: Query<(Entity, &mut MuzzleFlash, &mut Sprite, &mut Transform)>,
+) {
+    let dt = time.delta_seconds();
+    for (e, mut flash, mut sprite, mut transform) in &mut q {
+        flash.lifetime -= dt;
+        if flash.lifetime <= 0.0 {
+            commands.entity(e).despawn_recursive();
+            continue;
+        }
+        let pct = (flash.lifetime / flash.max_lifetime).clamp(0.0, 1.0);
+        // Quick brighten-then-fade so the flash punches but doesn't linger.
+        let alpha = (pct * 1.2).min(1.0);
+        sprite.color.set_alpha(alpha);
+        // Slight scale punch outward.
+        let scale = 1.0 + (1.0 - pct) * 0.4;
+        if let Some(size) = sprite.custom_size {
+            transform.scale = Vec3::new(scale, scale, 1.0);
+            // Keep size constant; rely on transform.scale for the punch.
+            let _ = size;
+        }
+    }
+}
+
+fn update_impact_sparks(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut q: Query<(Entity, &mut ImpactSpark, &mut Transform, &mut Sprite)>,
+) {
+    let dt = time.delta_seconds();
+    for (e, mut spark, mut transform, mut sprite) in &mut q {
+        spark.lifetime -= dt;
+        if spark.lifetime <= 0.0 {
+            commands.entity(e).despawn_recursive();
+            continue;
+        }
+        // Decelerate and drop with a hint of gravity for liveliness.
+        spark.velocity *= 0.94;
+        spark.velocity.y -= 220.0 * dt;
+        transform.translation += (spark.velocity * dt).extend(0.0);
+        let pct = (spark.lifetime / spark.max_lifetime).clamp(0.0, 1.0);
+        sprite.color.set_alpha(pct);
+    }
+}
+
+fn update_shockwaves(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut q: Query<(Entity, &mut ShockwaveRing, &mut Sprite)>,
+) {
+    let dt = time.delta_seconds();
+    for (e, mut ring, mut sprite) in &mut q {
+        ring.lifetime -= dt;
+        if ring.lifetime <= 0.0 {
+            commands.entity(e).despawn_recursive();
+            continue;
+        }
+        let pct = (ring.lifetime / ring.max_lifetime).clamp(0.0, 1.0);
+        let progress = 1.0 - pct;
+        let radius = ring.max_radius * (0.18 + progress * 0.85);
+        sprite.custom_size = Some(Vec2::splat(radius));
+        // Fade strongly toward the end.
+        sprite.color.set_alpha(pct * pct);
+    }
+}
+
+fn update_smoke_puffs(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut q: Query<(Entity, &mut SmokePuff, &mut Transform, &mut Sprite)>,
+) {
+    let dt = time.delta_seconds();
+    for (e, mut puff, mut transform, mut sprite) in &mut q {
+        puff.lifetime -= dt;
+        if puff.lifetime <= 0.0 {
+            commands.entity(e).despawn_recursive();
+            continue;
+        }
+        // Drift up, decelerate slightly with air drag.
+        puff.velocity *= 1.0 - 0.4 * dt;
+        transform.translation += (puff.velocity * dt).extend(0.0);
+        let pct = (puff.lifetime / puff.max_lifetime).clamp(0.0, 1.0);
+        let progress = 1.0 - pct;
+        let size = puff.start_size + (puff.end_size - puff.start_size) * progress;
+        sprite.custom_size = Some(Vec2::splat(size));
+        // Hold opacity briefly, then fade.
+        let alpha = if pct > 0.65 {
+            0.55
+        } else {
+            (pct / 0.65) * 0.55
+        };
+        sprite.color.set_alpha(alpha);
+    }
+}
+
+fn update_bullet_tracers(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut q: Query<(Entity, &mut BulletTracer, &mut Sprite)>,
+) {
+    let dt = time.delta_seconds();
+    for (e, mut tr, mut sprite) in &mut q {
+        tr.lifetime -= dt;
+        if tr.lifetime <= 0.0 {
+            commands.entity(e).despawn_recursive();
+            continue;
+        }
+        let pct = (tr.lifetime / tr.max_lifetime).clamp(0.0, 1.0);
+        sprite.color.set_alpha(pct);
+    }
+}
+
+/// Spawns a few ambient ember / ash particles per second within a square
+/// around the camera position.  Cheap atmospheric flair — capped count so
+/// it never overwhelms.
+fn spawn_ambient_embers(
+    mut commands: Commands,
+    time: Res<Time>,
+    assets: Res<BulletAssets>,
+    cameras: Query<&Transform, With<Camera>>,
+    existing: Query<(), With<AmbientEmber>>,
+    mut timer: Local<f32>,
+) {
+    *timer += time.delta_seconds();
+    if *timer < 0.07 {
+        return;
+    }
+    *timer = 0.0;
+    if existing.iter().count() > 80 {
+        return; // soft cap so the world doesn't fill with embers
+    }
+    let Ok(cam) = cameras.get_single() else {
+        return;
+    };
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let cam_pos = cam.translation.truncate();
+    // Spawn anywhere within ~700 px around the camera so embers are
+    // visible at any zoom level.
+    for _ in 0..rng.gen_range(1..=3) {
+        let x = cam_pos.x + rng.gen_range(-700.0..700.0);
+        let y = cam_pos.y + rng.gen_range(-450.0..450.0);
+        let life = rng.gen_range(2.5..5.0);
+        let vy = rng.gen_range(20.0..45.0);
+        let vx = rng.gen_range(-12.0..12.0);
+        // Subtle colour variation between embers (warm) and ash (grey).
+        let warm = rng.gen_bool(0.55);
+        let color = if warm {
+            Color::srgba(1.0, 0.55, 0.18, 0.85)
+        } else {
+            Color::srgba(0.62, 0.58, 0.50, 0.6)
+        };
+        commands.spawn((
+            SpriteBundle {
+                texture: assets.ember.clone(),
+                sprite: Sprite {
+                    custom_size: Some(Vec2::splat(rng.gen_range(2.0..4.0))),
+                    color,
+                    ..default()
+                },
+                transform: Transform::from_xyz(x, y, 7.5),
+                ..default()
+            },
+            AmbientEmber {
+                velocity: Vec2::new(vx, vy),
+                lifetime: life,
+                max_lifetime: life,
+                flicker: rng.gen_range(0.0..std::f32::consts::TAU),
+            },
+        ));
+    }
+}
+
+fn update_ambient_embers(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut q: Query<(Entity, &mut AmbientEmber, &mut Transform, &mut Sprite)>,
+) {
+    let dt = time.delta_seconds();
+    let t = time.elapsed_seconds();
+    for (e, mut em, mut transform, mut sprite) in &mut q {
+        em.lifetime -= dt;
+        if em.lifetime <= 0.0 {
+            commands.entity(e).despawn_recursive();
+            continue;
+        }
+        // Slight side-to-side wobble so embers don't rise in straight lines.
+        let wob = (t * 3.0 + em.flicker).sin() * 6.0;
+        transform.translation += (em.velocity * dt).extend(0.0);
+        transform.translation.x += wob * dt;
+        let pct = (em.lifetime / em.max_lifetime).clamp(0.0, 1.0);
+        // Gentle alpha ramp-in for the first 20% then smooth fade out.
+        let alpha = if pct > 0.8 {
+            ((1.0 - pct) / 0.2).clamp(0.0, 1.0)
+        } else {
+            pct
+        };
+        sprite.color.set_alpha(alpha * 0.85);
+    }
+}
+
+/// Tiny dust puff at the player's feet during running — re-uses the smoke
+/// puff sprite + lifetime model with a smaller scale and earthier tint.
+pub fn spawn_walking_dust(
+    commands: &mut Commands,
+    assets: &BulletAssets,
+    pos: Vec2,
+) {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let life = rng.gen_range(0.32..0.55);
+    let start = rng.gen_range(10.0..16.0);
+    let end = rng.gen_range(20.0..28.0);
+    let vy = rng.gen_range(8.0..18.0);
+    let vx = rng.gen_range(-12.0..12.0);
+    commands.spawn((
+        SpriteBundle {
+            texture: assets.smoke.clone(),
+            sprite: Sprite {
+                custom_size: Some(Vec2::splat(start)),
+                color: Color::srgba(0.62, 0.55, 0.42, 0.0),
+                ..default()
+            },
+            // Slightly under the player but above the ground tiles.
+            transform: Transform::from_xyz(pos.x, pos.y - 6.0, -10.0),
+            ..default()
+        },
+        SmokePuff {
+            lifetime: life,
+            max_lifetime: life,
+            velocity: Vec2::new(vx, vy),
+            start_size: start,
+            end_size: end,
+        },
+    ));
+}
+
+/// Spawns a column of 5 smoke puffs above an explodable that just blew up.
+/// Each puff drifts upward with a small horizontal jitter so the column
+/// reads as natural rising smoke rather than identical clones.
+pub fn spawn_smoke_column(
+    commands: &mut Commands,
+    assets: &BulletAssets,
+    pos: Vec2,
+) {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    for i in 0..6 {
+        let dx = rng.gen_range(-12.0..12.0);
+        let dy = i as f32 * 8.0; // staggered initial heights
+        let life = rng.gen_range(2.4..3.6);
+        let start = rng.gen_range(40.0..60.0);
+        let end = rng.gen_range(95.0..130.0);
+        let vy = rng.gen_range(45.0..70.0);
+        let vx = rng.gen_range(-12.0..12.0);
+        commands.spawn((
+            SpriteBundle {
+                texture: assets.smoke.clone(),
+                sprite: Sprite {
+                    custom_size: Some(Vec2::splat(start)),
+                    color: Color::srgba(0.45, 0.42, 0.40, 0.0),
+                    ..default()
+                },
+                transform: Transform::from_xyz(pos.x + dx, pos.y + dy, 6.5),
+                ..default()
+            },
+            SmokePuff {
+                lifetime: life,
+                max_lifetime: life,
+                velocity: Vec2::new(vx, vy),
+                start_size: start,
+                end_size: end,
+            },
+        ));
+    }
+}
+
+fn update_bullet_shells(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut q: Query<(Entity, &mut BulletShell, &mut Transform, &mut Sprite)>,
+) {
+    let dt = time.delta_seconds();
+    for (e, mut shell, mut transform, mut sprite) in &mut q {
+        shell.lifetime -= dt;
+        if shell.lifetime <= 0.0 {
+            commands.entity(e).despawn_recursive();
+            continue;
+        }
+        // Aerodynamic drag pulls velocity & spin down so the casing rolls
+        // to a stop after about 0.4 s.
+        shell.velocity *= 1.0 - 4.5 * dt;
+        shell.spin *= 1.0 - 4.0 * dt;
+        transform.translation += (shell.velocity * dt).extend(0.0);
+        transform.rotate_z(shell.spin * dt);
+        let pct = (shell.lifetime / shell.max_lifetime).clamp(0.0, 1.0);
+        // Hold full alpha for the first 70% of life, then fade smoothly.
+        let alpha = if pct > 0.3 { 1.0 } else { pct / 0.3 };
+        sprite.color.set_alpha(alpha);
+    }
+}
+
+/// Spawns a brass casing ejected to the right of the firing direction with
+/// a touch of randomness.  Lifetime ~3.5 s so the floor briefly fills with
+/// spent brass in heavy combat.
+fn spawn_bullet_shell(
+    commands: &mut Commands,
+    assets: &BulletAssets,
+    origin: Vec2,
+    direction: Vec2,
+) {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let dir = if direction.length_squared() > 0.0001 {
+        direction.normalize()
+    } else {
+        Vec2::X
+    };
+    // Eject sideways relative to firing direction (rotated 90°).
+    let side_sign: f32 = if rng.gen_bool(0.5) { 1.0 } else { -1.0 };
+    let perp = Vec2::new(-dir.y * side_sign, dir.x * side_sign);
+    // Mild random spread along the ejection direction.
+    let speed = rng.gen_range(120.0..200.0);
+    let velocity = perp * speed + Vec2::new(rng.gen_range(-20.0..20.0), rng.gen_range(-15.0..30.0));
+    let life = rng.gen_range(3.0..4.5);
+    let initial_angle = dir.y.atan2(dir.x) + side_sign * std::f32::consts::FRAC_PI_2;
+    commands.spawn((
+        SpriteBundle {
+            texture: assets.shell.clone(),
+            sprite: Sprite {
+                custom_size: Some(Vec2::new(7.0, 3.0)),
+                color: Color::srgba(1.0, 1.0, 1.0, 1.0),
+                ..default()
+            },
+            transform: Transform::from_xyz(origin.x, origin.y, -8.0)
+                .with_rotation(Quat::from_rotation_z(initial_angle)),
+            ..default()
+        },
+        BulletShell {
+            velocity,
+            spin: rng.gen_range(8.0..18.0) * side_sign,
+            lifetime: life,
+            max_lifetime: life,
+        },
+    ));
+}
+
+/// Spawns a short, fading streak in the direction the bullet is travelling.
+/// Renders right at the gun tip; pure cosmetic so the firing path is
+/// visible even when the bullet itself is small.
+fn spawn_bullet_tracer(
+    commands: &mut Commands,
+    assets: &BulletAssets,
+    origin: Vec2,
+    direction: Vec2,
+) {
+    let dir = if direction.length_squared() > 0.0001 {
+        direction.normalize()
+    } else {
+        Vec2::X
+    };
+    let angle = dir.y.atan2(dir.x);
+    let length = 60.0;
+    // Origin at the bullet start, sprite anchored centred so we offset
+    // forward by half the length.
+    let offset = dir * (length * 0.5);
+    let life = 0.18;
+    commands.spawn((
+        SpriteBundle {
+            texture: assets.tracer.clone(),
+            sprite: Sprite {
+                custom_size: Some(Vec2::new(length, 4.0)),
+                color: Color::srgba(1.0, 0.95, 0.55, 0.85),
+                ..default()
+            },
+            transform: Transform::from_xyz(origin.x + offset.x, origin.y + offset.y, 8.7)
+                .with_rotation(Quat::from_rotation_z(angle)),
+            ..default()
+        },
+        BulletTracer {
+            lifetime: life,
+            max_lifetime: life,
+        },
+    ));
+}
+
+// ── FX sprite builders ────────────────────────────────────────────────
+
+fn build_muzzle_flash_image() -> Image {
+    let core: Rgba = [255, 255, 240, 255];
+    let hot: Rgba = [255, 240, 160, 255];
+    let mid: Rgba = [255, 180, 60, 255];
+    let edge: Rgba = [220, 90, 30, 220];
+    let smoke: Rgba = [180, 130, 80, 120];
+
+    let mut c = Canvas::new(28, 16);
+    // Star burst in the centre — tip points to +X (gun barrel direction).
+    c.fill_rect(0, 0, 28, 16, [0, 0, 0, 0]);
+    c.fill_circle(12, 8, 6, edge);
+    c.fill_circle(13, 8, 5, mid);
+    c.fill_circle(14, 8, 4, hot);
+    c.fill_circle(14, 8, 2, core);
+    // Forward jet of flame (toward muzzle tip)
+    c.fill_rect(18, 7, 6, 2, hot);
+    c.fill_rect(20, 7, 4, 2, mid);
+    c.fill_rect(22, 8, 4, 1, edge);
+    c.put(26, 8, edge);
+    // A few smoke pixels trailing the burst.
+    c.put(2, 9, smoke);
+    c.put(4, 6, smoke);
+    c.put(6, 11, smoke);
+    // Star spikes (4 cardinal) for that classic burst silhouette.
+    c.fill_rect(13, 1, 2, 14, hot);
+    c.fill_rect(7, 7, 14, 2, hot);
+    c.fill_rect(13, 3, 2, 10, core);
+    c.fill_rect(9, 7, 10, 2, core);
+
+    c.into_image()
+}
+
+fn build_spark_image() -> Image {
+    // A single bright pixel-cluster — the sprite is small and gets scaled;
+    // we use a 5×5 canvas so it's a clean diamond-ish shape.
+    let core: Rgba = [255, 250, 220, 255];
+    let mid: Rgba = [255, 220, 120, 255];
+    let edge: Rgba = [255, 150, 60, 255];
+
+    let mut c = Canvas::new(5, 5);
+    c.fill_rect(0, 0, 5, 5, [0, 0, 0, 0]);
+    c.put(2, 0, edge);
+    c.put(2, 4, edge);
+    c.put(0, 2, edge);
+    c.put(4, 2, edge);
+    c.put(1, 1, mid);
+    c.put(3, 1, mid);
+    c.put(1, 3, mid);
+    c.put(3, 3, mid);
+    c.put(2, 1, mid);
+    c.put(1, 2, mid);
+    c.put(3, 2, mid);
+    c.put(2, 3, mid);
+    c.put(2, 2, core);
+    c.into_image()
+}
+
+fn build_ember_image() -> Image {
+    // Tiny 3×3 glowing pixel — bright core, dim halo.  Sprite is scaled
+    // to 2-4× at spawn so the pixel feel remains.
+    let core: Rgba = [255, 235, 180, 255];
+    let mid: Rgba = [255, 170, 90, 255];
+    let edge: Rgba = [180, 90, 30, 200];
+    let mut c = Canvas::new(3, 3);
+    c.fill_rect(0, 0, 3, 3, [0, 0, 0, 0]);
+    c.put(1, 1, core);
+    c.put(0, 1, mid);
+    c.put(2, 1, mid);
+    c.put(1, 0, mid);
+    c.put(1, 2, mid);
+    c.put(0, 0, edge);
+    c.put(2, 0, edge);
+    c.put(0, 2, edge);
+    c.put(2, 2, edge);
+    c.into_image()
+}
+
+fn build_shell_image() -> Image {
+    // Brass casing — small, gold-coloured, with a darker rim at the case
+    // mouth.  Anchored centred so rotation looks natural.
+    let body: Rgba = [205, 170, 60, 255];
+    let body_light: Rgba = [240, 215, 110, 255];
+    let body_dark: Rgba = [120, 90, 30, 255];
+    let rim: Rgba = [60, 44, 18, 255];
+    let mut c = Canvas::new(7, 3);
+    c.fill_rect(0, 0, 7, 3, [0, 0, 0, 0]);
+    c.fill_rect(0, 0, 7, 3, body);
+    c.fill_rect(0, 0, 7, 1, body_light);
+    c.fill_rect(0, 2, 7, 1, body_dark);
+    c.fill_rect(6, 0, 1, 3, rim);
+    c.into_image()
+}
+
+fn build_smoke_puff_image() -> Image {
+    // Soft round blob biased toward grey-brown — multiplied by sprite color
+    // (0.45, 0.42, 0.40) at spawn so the texture itself stays pale.
+    let outer: Rgba = [220, 220, 220, 255];
+    let mid: Rgba = [240, 240, 240, 255];
+    let core: Rgba = [255, 255, 255, 255];
+    let mut c = Canvas::new(32, 32);
+    c.fill_rect(0, 0, 32, 32, [0, 0, 0, 0]);
+    c.fill_circle(16, 16, 14, outer);
+    c.fill_circle(16, 16, 11, mid);
+    c.fill_circle(15, 15, 7, core);
+    // Ragged edge so the blob reads as smoke, not a planet.
+    for &(x, y) in &[(4, 18), (28, 14), (15, 4), (16, 28), (8, 8), (24, 24)] {
+        c.fill_circle(x, y, 3, mid);
+    }
+    c.into_image()
+}
+
+fn build_tracer_image() -> Image {
+    // Horizontal streak — bright core, fading toward both ends.
+    let edge: Rgba = [255, 200, 80, 220];
+    let mid: Rgba = [255, 230, 140, 255];
+    let core: Rgba = [255, 255, 220, 255];
+    let mut c = Canvas::new(32, 4);
+    c.fill_rect(0, 0, 32, 4, [0, 0, 0, 0]);
+    c.fill_rect(0, 1, 32, 2, edge);
+    c.fill_rect(2, 1, 28, 2, mid);
+    c.fill_rect(6, 1, 20, 2, core);
+    // Faint bookends.
+    c.put(0, 1, edge);
+    c.put(31, 1, edge);
+    c.put(0, 2, edge);
+    c.put(31, 2, edge);
+    c.into_image()
+}
+
+fn build_flame_puff_image() -> Image {
+    // Soft, irregular flame blob — bright core fading through orange to a
+    // smoky outer rim.  Slight vertical asymmetry so it doesn't read as a
+    // perfect circle when scaled up.
+    let core: Rgba = [255, 250, 220, 255];
+    let hot: Rgba = [255, 215, 120, 255];
+    let mid: Rgba = [255, 150, 50, 255];
+    let edge: Rgba = [220, 70, 25, 230];
+    let smoke: Rgba = [110, 70, 40, 140];
+
+    let w: i32 = 28;
+    let h: i32 = 22;
+    let mut c = Canvas::new(w, h);
+    c.fill_rect(0, 0, w, h, [0, 0, 0, 0]);
+    let cx = w / 2;
+    let cy = h / 2;
+    // Smoky outer edge
+    c.fill_circle(cx, cy, 10, smoke);
+    c.fill_circle(cx + 1, cy - 1, 8, edge);
+    c.fill_circle(cx - 1, cy + 1, 7, edge);
+    // Mid orange ring
+    c.fill_circle(cx, cy, 6, mid);
+    c.fill_circle(cx + 2, cy - 2, 4, hot);
+    // Bright core (off-centre, biased forward toward +x — flames point
+    // along the velocity direction, which the bullet rotates into).
+    c.fill_circle(cx + 3, cy, 3, hot);
+    c.fill_circle(cx + 4, cy, 2, core);
+    // Few bright sparks scattered through.
+    c.put(cx - 4, cy - 3, hot);
+    c.put(cx + 6, cy + 3, core);
+    c.put(cx - 2, cy + 4, mid);
+    c.into_image()
+}
+
+fn build_shockwave_image() -> Image {
+    // Hollow ring — bright on the rim, transparent inside.  Final scaling
+    // is animated; this is just the silhouette.
+    let outer: Rgba = [255, 220, 140, 255];
+    let mid: Rgba = [255, 180, 80, 255];
+    let inner: Rgba = [220, 110, 40, 180];
+
+    let size = 64;
+    let mut c = Canvas::new(size, size);
+    c.fill_rect(0, 0, size, size, [0, 0, 0, 0]);
+    let cx = size / 2;
+    let cy = size / 2;
+    for y in 0..size {
+        for x in 0..size {
+            let dx = (x - cx) as f32;
+            let dy = (y - cy) as f32;
+            let d = (dx * dx + dy * dy).sqrt();
+            if d > 27.0 && d < 31.0 {
+                c.put(x, y, outer);
+            } else if d > 25.0 && d <= 27.0 {
+                c.put(x, y, mid);
+            } else if d > 22.0 && d <= 25.0 {
+                c.put(x, y, inner);
+            }
+        }
+    }
+    c.into_image()
 }
