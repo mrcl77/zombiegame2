@@ -1199,7 +1199,7 @@ fn spawn_zombie_listener(
     nav: Res<NavGrid>,
     segments: Res<MapSegmentUnlockState>,
     existing: Query<(), With<Zombie>>,
-    _players: Query<&Transform, With<Player>>,
+    players: Query<&Transform, With<Player>>,
 ) {
     let alive = existing.iter().count();
     let mut spawned = 0;
@@ -1217,11 +1217,41 @@ fn spawn_zombie_listener(
         .filter(|s| s.interior_only && segments.is_unlocked(s.segment_idx))
         .collect();
 
+    // Detect whether any player has descended into the metro level — if so
+    // we route a fraction of spawns to a fixed underground spawn so the
+    // tunnel actually fills up with zombies "leaking down from upstairs".
+    let any_player_underground = players
+        .iter()
+        .any(|t| t.translation.y < crate::underground::UNDER_TOP);
+
     for ev in events.read() {
         if alive + spawned >= MAX_ALIVE_ZOMBIES {
             continue;
         }
         spawned += 1;
+
+        // 60% of the time, when any player is in the metro, spawn this
+        // zombie underground at the manhole drop point (on the platform).
+        if any_player_underground && rng.gen_bool(0.6) {
+            let pos = Vec2::new(
+                crate::underground::MANHOLE_X + rng.gen_range(-30.0..30.0),
+                crate::underground::UNDER_TOP - 100.0 + rng.gen_range(-20.0..20.0),
+            );
+            let base = ev.kind.base_speed();
+            let jitter: f32 = rng.gen_range(-12.0..18.0);
+            let speed = base + jitter;
+            let net_id = ctx.alloc_zombie_id();
+            spawn_zombie_entity(
+                &mut commands,
+                &assets,
+                pos,
+                net_id,
+                ev.kind.base_hp(),
+                speed,
+                ev.kind,
+            );
+            continue;
+        }
 
         let pool: &Vec<&SpawnPointSpec> = if matches!(ev.kind, ZombieKind::Fast)
             && !interior.is_empty()
@@ -1309,9 +1339,14 @@ fn update_nav_flow(mut nav: ResMut<NavGrid>, players: Query<(&Transform, &Player
     }
 
     if !rebuilds.is_empty() {
-        let walkable = nav.walkable.clone();
+        // Run all BFS passes against the live `nav.walkable` slice (no
+        // 11.5k-bool clone), then write the results back to the same nav
+        // resource.  Split-borrowing field-by-field keeps the borrow checker
+        // happy: the borrow of `nav.walkable` and the mutation of
+        // `nav.player_flow` are on disjoint fields.
+        let nav = &mut *nav;
         for (id, pos, tile) in rebuilds {
-            let field = bfs_distance_field(&walkable, pos);
+            let field = bfs_distance_field(&nav.walkable, pos);
             nav.player_flow.insert(id, field);
             nav.player_flow_tile.insert(id, tile);
         }
@@ -1502,7 +1537,8 @@ fn zombie_attack(
                 continue;
             }
             let p = pt.translation.truncate();
-            if p.distance(zp) < PLAYER_RADIUS + zr {
+            let r = PLAYER_RADIUS + zr;
+            if p.distance_squared(zp) < r * r {
                 match zombie.kind {
                     ZombieKind::Exploder => {
                         triggered = true;
@@ -1608,7 +1644,7 @@ fn giant_toxic_attack(
                 continue;
             }
             let pp = pt.translation.truncate();
-            if pp.distance(zp) < GIANT_ATTACK_RANGE {
+            if pp.distance_squared(zp) < GIANT_ATTACK_RANGE * GIANT_ATTACK_RANGE {
                 attack.cooldown = GIANT_ATTACK_COOLDOWN;
                 commands.spawn((
                     SpriteBundle {
@@ -1660,7 +1696,7 @@ fn toxic_cloud_tick(
                     continue;
                 }
                 let pp = pt.translation.truncate();
-                if pp.distance(cp) < TOXIC_CLOUD_RADIUS {
+                if pp.distance_squared(cp) < TOXIC_CLOUD_RADIUS * TOXIC_CLOUD_RADIUS {
                     dmg.send(PlayerDamagedEvent {
                         target_id: player.id,
                         amount: (TOXIC_CLOUD_DPS * 0.5) as i32,

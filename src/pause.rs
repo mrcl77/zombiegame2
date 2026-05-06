@@ -12,7 +12,9 @@ impl Plugin for PausePlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             Update,
-            pause_toggle_input.run_if(in_state(GameState::Playing)),
+            pause_toggle_input
+                .after(crate::chat::ChatInputSet)
+                .run_if(in_state(GameState::Playing)),
         )
         .add_systems(OnEnter(PauseState::Paused), spawn_pause_ui)
         .add_systems(OnExit(PauseState::Paused), despawn_pause_ui)
@@ -27,9 +29,16 @@ impl Plugin for PausePlugin {
 fn pause_toggle_input(
     keys: Res<ButtonInput<KeyCode>>,
     current: Res<State<PauseState>>,
+    chat: Res<crate::chat::ChatInputState>,
     mut next: ResMut<NextState<PauseState>>,
 ) {
     if !keys.just_pressed(KeyCode::Escape) {
+        return;
+    }
+    // Esc is a chat-cancel too — let the chat handler swallow the press
+    // before we fall through to pause toggling.  `chat_input_system` runs
+    // in the same Update set so the `open` flag is fresh for this frame.
+    if chat.open {
         return;
     }
     match current.get() {

@@ -6,13 +6,19 @@ use crate::bullet::{
     spawn_bullet_entity, spawn_explosion_entity, Bullet, BulletAssets, Explosion,
     EXPLOSION_LIFETIME,
 };
+use crate::chat::ChatLog;
 use crate::map::MapSegmentUnlockState;
 use crate::net::{
-    broadcast, is_host, is_net_client, ClientInEvent, ClientMsg, LocalInput, NetBulletState,
-    NetContext, NetEntities, NetExplosionState, NetMode, NetPickupState, NetPlayerState,
-    NetSnapshot, NetZombieState, PlayerNicknames, RemoteInputs, ServerEvent, ServerMsg,
+    broadcast, dq_pos, dq_radius, dq_rot, is_host, is_net_client, q_pos, q_radius, q_rot,
+    ClientInEvent, ClientMsg, LocalInput, NetBulletState, NetContext, NetEntities,
+    NetExplosionState, NetMode, NetPickupState, NetPlayerState, NetSnapshot, NetZombieState,
+    PlayerNicknames, RemoteInputs, ServerEvent, ServerMsg,
 };
-use crate::player::{spawn_player_entity, LogicalPos, Player, PlayerAssets};
+use crate::player::{
+    apply_input_to_local, spawn_player_entity, InputHistory, LogicalPos, Player, PlayerAssets,
+    PlayerDiedEvent,
+};
+use crate::map::MapObstacles;
 use crate::wave::WaveState;
 use crate::weapon::{
     spawn_armor_entity, spawn_health_entity, spawn_money_entity, spawn_pickup_entity, ArmorPickup,
@@ -64,6 +70,7 @@ pub struct NetSyncPlugin;
 impl Plugin for NetSyncPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SnapshotHistory>()
+            .init_resource::<ApplyScratch>()
             .add_systems(
                 FixedUpdate,
                 (server_receive_inputs, server_broadcast_snapshot)
@@ -94,6 +101,7 @@ fn server_receive_inputs(
     ctx: Res<NetContext>,
     mut remote: ResMut<RemoteInputs>,
     mut nicknames: ResMut<PlayerNicknames>,
+    mut chat_log: ResMut<ChatLog>,
 ) {
     let Some(host) = ctx.host.as_ref() else {
         return;
@@ -105,8 +113,12 @@ fn server_receive_inputs(
     while let Ok(e) = rx.try_recv() {
         match e {
             ServerEvent::Input { id, input } => {
-                // Merge one-shot switch_slot to prevent lost inputs.
+                // Sanitise BEFORE merge — a malicious / buggy client could
+                // have sent NaN/Inf or out-of-range slot ids that we must
+                // not feed to the simulation.
                 let mut merged = input;
+                merged.sanitize();
+                // Merge one-shot switch_slot to prevent lost inputs.
                 if merged.switch_slot == 0 {
                     if let Some(prev) = remote.0.get(&id) {
                         merged.switch_slot = prev.switch_slot;
@@ -124,8 +136,28 @@ fn server_receive_inputs(
                 remote.0.remove(&id);
                 nicknames.0.remove(&id);
             }
+            ServerEvent::ChatRelay { id, text } => {
+                let author = nicknames
+                    .0
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("P{id}"));
+                chat_log.push(author.clone(), text.clone());
+                broadcast(host, &ServerMsg::Chat { author, text });
+            }
         }
     }
+}
+
+/// Tracks state needed to skip unchanged sub-fields between snapshots.
+#[derive(Default)]
+struct BroadcastState {
+    /// Sorted ids of last broadcast pickups — same set ⇒ skip the field.
+    last_pickup_ids: Vec<u32>,
+    /// Tick when nicknames last changed — we re-send when our local hash
+    /// of (id, nickname) pairs differs.  Cheap on a 4-player cap.
+    last_nicknames: Vec<(u8, String)>,
+    tick: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -144,17 +176,18 @@ fn server_broadcast_snapshot(
     segments: Res<MapSegmentUnlockState>,
     nicknames: Res<PlayerNicknames>,
     game_state: Res<State<GameState>>,
-    mut tick: Local<u64>,
+    mut bcast: Local<BroadcastState>,
 ) {
     let Some(host) = ctx.host.as_ref() else {
         return;
     };
-    *tick += 1;
+    bcast.tick += 1;
+    let tick = bcast.tick;
     // Rate-limit snapshot broadcast to ~30 Hz so we don't flood the link
     // with redundant state.  Inputs still flow at the full FixedUpdate rate.
     // We always send the very first tick so the client sees the world
     // state immediately on join.
-    if *tick > 1 && !(*tick).is_multiple_of(SNAPSHOT_INTERVAL_TICKS) {
+    if tick > 1 && !tick.is_multiple_of(SNAPSHOT_INTERVAL_TICKS) {
         return;
     }
 
@@ -162,13 +195,16 @@ fn server_broadcast_snapshot(
         .iter()
         .map(|(t, p)| NetPlayerState {
             id: p.id,
-            x: t.translation.x,
-            y: t.translation.y,
-            rot: t.rotation.to_euler(EulerRot::ZYX).0,
-            hp: p.hp,
-            armor: p.armor,
+            x: q_pos(t.translation.x),
+            y: q_pos(t.translation.y),
+            rot: q_rot(t.rotation.to_euler(EulerRot::ZYX).0),
+            // HP/armor zawsze w 0..=PLAYER_MAX_HP (100), więc i16 to overkill
+            // ale spójność z resztą snapshot fields.
+            hp: p.hp.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            armor: p.armor.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
             active_slot: p.active_slot,
             slot1_weapon: p.slots[1].map(|w| w.as_u8()).unwrap_or(255),
+            last_processed_seq: p.last_processed_seq,
         })
         .collect();
 
@@ -176,9 +212,9 @@ fn server_broadcast_snapshot(
         .iter()
         .map(|(t, id, z)| NetZombieState {
             id: id.0,
-            x: t.translation.x,
-            y: t.translation.y,
-            rot: t.rotation.to_euler(EulerRot::ZYX).0,
+            x: q_pos(t.translation.x),
+            y: q_pos(t.translation.y),
+            rot: q_rot(t.rotation.to_euler(EulerRot::ZYX).0),
             kind: z.kind.as_u8(),
         })
         .collect();
@@ -187,9 +223,9 @@ fn server_broadcast_snapshot(
         .iter()
         .map(|(t, id, b)| NetBulletState {
             id: id.0,
-            x: t.translation.x,
-            y: t.translation.y,
-            rot: t.rotation.to_euler(EulerRot::ZYX).0,
+            x: q_pos(t.translation.x),
+            y: q_pos(t.translation.y),
+            rot: q_rot(t.rotation.to_euler(EulerRot::ZYX).0),
             is_rocket: b.is_rocket,
         })
         .collect();
@@ -198,32 +234,32 @@ fn server_broadcast_snapshot(
         .iter()
         .map(|(t, id, pk)| NetPickupState {
             id: id.0,
-            x: t.translation.x,
-            y: t.translation.y,
+            x: q_pos(t.translation.x),
+            y: q_pos(t.translation.y),
             kind: pk.kind.as_u8(),
         })
         .collect();
     for (t, id) in &health_pickups {
         pickup_states.push(NetPickupState {
             id: id.0,
-            x: t.translation.x,
-            y: t.translation.y,
+            x: q_pos(t.translation.x),
+            y: q_pos(t.translation.y),
             kind: HEALTH_PICKUP_KIND,
         });
     }
     for (t, id) in &armor_pickups {
         pickup_states.push(NetPickupState {
             id: id.0,
-            x: t.translation.x,
-            y: t.translation.y,
+            x: q_pos(t.translation.x),
+            y: q_pos(t.translation.y),
             kind: ARMOR_PICKUP_KIND,
         });
     }
     for (t, id, mp) in &money_pickups {
         pickup_states.push(NetPickupState {
             id: id.0,
-            x: t.translation.x,
-            y: t.translation.y,
+            x: q_pos(t.translation.x),
+            y: q_pos(t.translation.y),
             kind: if mp.factor >= 3 {
                 MONEY3X_PICKUP_KIND
             } else {
@@ -231,44 +267,75 @@ fn server_broadcast_snapshot(
             },
         });
     }
+    // Decide whether to skip the pickups field — the set is "stable" if the
+    // sorted id list matches the previous tick's broadcast.  Pickups are
+    // static (no per-tick movement), so id-set equality ⇒ snapshot equality.
+    let mut current_pickup_ids: Vec<u32> = pickup_states.iter().map(|p| p.id).collect();
+    current_pickup_ids.sort_unstable();
+    let pickups_field = if current_pickup_ids == bcast.last_pickup_ids {
+        None
+    } else {
+        bcast.last_pickup_ids = current_pickup_ids;
+        Some(pickup_states)
+    };
 
     let explosion_states: Vec<NetExplosionState> = explosions
         .iter()
         .map(|(t, id, exp)| NetExplosionState {
             id: id.0,
-            x: t.translation.x,
-            y: t.translation.y,
-            radius: exp.radius,
-            remaining: exp.lifetime,
+            x: q_pos(t.translation.x),
+            y: q_pos(t.translation.y),
+            radius: q_radius(exp.radius),
+            remaining_ms: (exp.lifetime * 1000.0).clamp(0.0, u16::MAX as f32) as u16,
         })
         .collect();
 
+    // Same trick for nicknames — only re-send the table when (id, name)
+    // pairs differ from last tick.  We sort by id so HashMap order doesn't
+    // create false-positive diffs.
+    let mut current_nicks: Vec<(u8, String)> =
+        nicknames.0.iter().map(|(&id, n)| (id, n.clone())).collect();
+    current_nicks.sort_by_key(|&(id, _)| id);
+    let nicknames_field = if current_nicks == bcast.last_nicknames {
+        None
+    } else {
+        bcast.last_nicknames = current_nicks.clone();
+        Some(current_nicks)
+    };
+
     let snap = NetSnapshot {
-        tick: *tick,
+        tick,
         players: player_states,
         zombies: zombie_states,
         bullets: bullet_states,
-        pickups: pickup_states,
+        pickups: pickups_field,
         explosions: explosion_states,
         score: score.0,
         wave: wave.current_wave,
         in_break: wave.in_break,
-        break_secs: wave.break_timer.remaining_secs(),
+        break_ms: (wave.break_timer.remaining_secs() * 1000.0).clamp(0.0, u16::MAX as f32) as u16,
         zombies_to_spawn: wave.zombies_to_spawn,
         game_over: *game_state.get() == GameState::GameOver,
         unlocked_segments_mask: segments.as_mask(),
-        player_nicknames: nicknames
-            .0
-            .iter()
-            .map(|(&id, n)| (id, n.clone()))
-            .collect(),
+        player_nicknames: nicknames_field,
     };
 
     broadcast(host, &ServerMsg::Snapshot(Box::new(snap)));
 }
 
-fn client_send_input(ctx: Res<NetContext>, local: Res<LocalInput>) {
+fn client_send_input(
+    ctx: Res<NetContext>,
+    mut local: ResMut<LocalInput>,
+    mut history: ResMut<crate::player::InputHistory>,
+) {
     if let Some(client) = ctx.client.as_ref() {
+        // Stamp a fresh sequence number — client_send_input fires once per
+        // FixedUpdate, so seq increments at exactly the simulation rate.
+        // Server echoes the highest seq it processed back in NetPlayerState
+        // so we can ack-and-trim our local history below.
+        history.next_seq = history.next_seq.wrapping_add(1);
+        local.0.seq = history.next_seq;
+        history.push(&local.0);
         let _ = client.sender.send(ClientMsg::Input(local.0));
     }
 }
@@ -282,6 +349,22 @@ struct SnapshotAssets<'w> {
     bullet: Res<'w, BulletAssets>,
     weapon: Res<'w, WeaponAssets>,
     extra: Res<'w, ExtraPickupAssets>,
+}
+
+/// Same trick: groups all the mutable game-state resources `client_apply_snapshots`
+/// touches into a single `SystemParam`, so the 16-arg limit isn't blown when
+/// we add scratch buffers / future state.
+#[derive(SystemParam)]
+struct SnapshotApplyCtx<'w> {
+    score: ResMut<'w, Score>,
+    wave: ResMut<'w, WaveState>,
+    segments: ResMut<'w, MapSegmentUnlockState>,
+    nicknames: ResMut<'w, PlayerNicknames>,
+    scratch: ResMut<'w, ApplyScratch>,
+    input_history: ResMut<'w, InputHistory>,
+    obstacles: Res<'w, MapObstacles>,
+    chat_log: ResMut<'w, ChatLog>,
+    died_evw: EventWriter<'w, PlayerDiedEvent>,
 }
 
 /// Find the (older, newer) snapshot pair whose received-times bracket
@@ -359,6 +442,26 @@ fn despawn_stale<K>(
     }
 }
 
+/// Re-usable scratch buffers for snapshot application.  Held as a Resource
+/// (instead of `Local`) so we don't blow Bevy's 16-param-per-system limit on
+/// `client_apply_snapshots`, which already pulls a lot of state.  The values
+/// are reset each tick — only the underlying allocations persist.
+#[derive(Resource, Default)]
+struct ApplyScratch {
+    older_players: std::collections::HashMap<u8, (f32, f32)>,
+    newer_players: std::collections::HashMap<u8, (f32, f32)>,
+    older_zombies: std::collections::HashMap<u32, (f32, f32)>,
+    newer_zombies: std::collections::HashMap<u32, (f32, f32)>,
+    older_bullets: std::collections::HashMap<u32, (f32, f32)>,
+    newer_bullets: std::collections::HashMap<u32, (f32, f32)>,
+    seen_players: HashSet<u8>,
+    seen_zombies: HashSet<u32>,
+    seen_bullets: HashSet<u32>,
+    seen_pickups: HashSet<u32>,
+    seen_explosions: HashSet<u32>,
+    new_snaps: Vec<Box<NetSnapshot>>,
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn client_apply_snapshots(
     time: Res<Time>,
@@ -384,19 +487,25 @@ fn client_apply_snapshots(
         (&mut Explosion, &mut Sprite),
         (Without<Player>, Without<Zombie>, Without<Bullet>),
     >,
-    mut score: ResMut<Score>,
-    mut wave: ResMut<WaveState>,
-    mut segments: ResMut<MapSegmentUnlockState>,
-    mut nicknames: ResMut<PlayerNicknames>,
     mut next_state: ResMut<NextState<GameState>>,
+    mut apply_ctx: SnapshotApplyCtx,
 ) {
+    let score = &mut apply_ctx.score;
+    let wave = &mut apply_ctx.wave;
+    let segments = &mut apply_ctx.segments;
+    let nicknames = &mut apply_ctx.nicknames;
+    let scratch = &mut apply_ctx.scratch;
+    let input_history = &mut apply_ctx.input_history;
+    let obstacles = &apply_ctx.obstacles;
+    let chat_log = &mut apply_ctx.chat_log;
+    let died_evw = &mut apply_ctx.died_evw;
     let Some(client) = ctx.client.as_ref() else {
         return;
     };
     let events_arc = client.events.clone();
 
     // ── 1. Drain incoming events ──────────────────────────────────────────
-    let mut new_snaps: Vec<Box<NetSnapshot>> = Vec::new();
+    scratch.new_snaps.clear();
     let mut disconnect = false;
     {
         let Ok(rx) = events_arc.lock() else {
@@ -408,11 +517,16 @@ fn client_apply_snapshots(
                     // Drop stale snapshots — TCP guarantees order, but be
                     // defensive in case we ever swap the transport.
                     if s.tick > history.last_applied_tick {
-                        new_snaps.push(s);
+                        scratch.new_snaps.push(s);
                     }
                 }
-                ClientInEvent::Disconnected | ClientInEvent::FullLobby => {
+                ClientInEvent::Disconnected
+                | ClientInEvent::FullLobby
+                | ClientInEvent::ProtocolMismatch { .. } => {
                     disconnect = true;
+                }
+                ClientInEvent::Chat { author, text } => {
+                    chat_log.push(author, text);
                 }
                 _ => {}
             }
@@ -431,7 +545,7 @@ fn client_apply_snapshots(
 
     // ── 2. Push new snapshots into the history buffer ─────────────────────
     let now = time.elapsed_seconds_f64();
-    for s in new_snaps {
+    for s in scratch.new_snaps.drain(..) {
         history.entries.push_back(BufferedSnapshot {
             received: now,
             snap: s,
@@ -465,11 +579,17 @@ fn client_apply_snapshots(
     wave.current_wave = lifecycle.wave;
     wave.in_break = lifecycle.in_break;
     wave.zombies_to_spawn = lifecycle.zombies_to_spawn;
-    wave.break_timer = Timer::from_seconds(lifecycle.break_secs.max(0.01), TimerMode::Once);
+    wave.break_timer = Timer::from_seconds(
+        ((lifecycle.break_ms as f32) / 1000.0).max(0.01),
+        TimerMode::Once,
+    );
     segments.apply_mask(lifecycle.unlocked_segments_mask);
-    nicknames.0.clear();
-    for (id, n) in &lifecycle.player_nicknames {
-        nicknames.0.insert(*id, n.clone());
+    // Nicknames: None ⇒ unchanged, keep what we have.  Some(list) ⇒ rebuild.
+    if let Some(nicks) = lifecycle.player_nicknames.as_ref() {
+        nicknames.0.clear();
+        for (id, n) in nicks {
+            nicknames.0.insert(*id, n.clone());
+        }
     }
 
     // ── 4. Find interpolation pair for remote-entity poses ────────────────
@@ -485,87 +605,118 @@ fn client_apply_snapshots(
     };
 
     // Pre-build id→pos lookups so per-entity interpolation is O(1).
-    use std::collections::HashMap;
-    let mut older_players: HashMap<u8, (f32, f32)> = HashMap::new();
-    let mut newer_players: HashMap<u8, (f32, f32)> = HashMap::new();
-    let mut older_zombies: HashMap<u32, (f32, f32)> = HashMap::new();
-    let mut newer_zombies: HashMap<u32, (f32, f32)> = HashMap::new();
-    let mut older_bullets: HashMap<u32, (f32, f32)> = HashMap::new();
-    let mut newer_bullets: HashMap<u32, (f32, f32)> = HashMap::new();
+    // Re-use scratch HashMaps from `Local` state — saves 6 alloc/free
+    // cycles per frame.
+    scratch.older_players.clear();
+    scratch.newer_players.clear();
+    scratch.older_zombies.clear();
+    scratch.newer_zombies.clear();
+    scratch.older_bullets.clear();
+    scratch.newer_bullets.clear();
     if let Some(o) = older_snap {
         for p in &o.players {
-            older_players.insert(p.id, (p.x, p.y));
+            scratch.older_players.insert(p.id, (dq_pos(p.x), dq_pos(p.y)));
         }
         for z in &o.zombies {
-            older_zombies.insert(z.id, (z.x, z.y));
+            scratch.older_zombies.insert(z.id, (dq_pos(z.x), dq_pos(z.y)));
         }
         for b in &o.bullets {
-            older_bullets.insert(b.id, (b.x, b.y));
+            scratch.older_bullets.insert(b.id, (dq_pos(b.x), dq_pos(b.y)));
         }
     }
     if let Some(n) = newer_snap {
         for p in &n.players {
-            newer_players.insert(p.id, (p.x, p.y));
+            scratch.newer_players.insert(p.id, (dq_pos(p.x), dq_pos(p.y)));
         }
         for z in &n.zombies {
-            newer_zombies.insert(z.id, (z.x, z.y));
+            scratch.newer_zombies.insert(z.id, (dq_pos(z.x), dq_pos(z.y)));
         }
         for b in &n.bullets {
-            newer_bullets.insert(b.id, (b.x, b.y));
+            scratch.newer_bullets.insert(b.id, (dq_pos(b.x), dq_pos(b.y)));
         }
     }
 
     // ── 5. Players: lifecycle + interpolated remote positions ─────────────
     let my_id = ctx.my_id;
-    let mut seen_players: HashSet<u8> = HashSet::new();
+    scratch.seen_players.clear();
     for np in &lifecycle.players {
-        seen_players.insert(np.id);
+        scratch.seen_players.insert(np.id);
         match net_entities.players.get(&np.id).copied() {
             Some(ent) => {
-                if let Ok((mut t, mut p, lp)) = players.get_mut(ent) {
-                    p.hp = np.hp;
-                    p.armor = np.armor;
+                if let Ok((mut t, mut p, mut lp)) = players.get_mut(ent) {
+                    p.hp = np.hp as i32;
+                    p.armor = np.armor as i32;
                     p.active_slot = np.active_slot;
                     if np.slot1_weapon == 255 {
                         p.slots[1] = None;
                     } else {
                         p.slots[1] = Some(Weapon::from_u8(np.slot1_weapon));
                     }
+                    let nx = dq_pos(np.x);
+                    let ny = dq_pos(np.y);
 
                     if np.id == my_id {
-                        // Local player: client-side prediction reconciles
-                        // toward the server's authoritative position with
-                        // a soft lerp.  We modify `LogicalPos.curr` (not
-                        // Transform) so the reconciliation persists into
-                        // the next FixedUpdate's sim — `interpolate_logical_pos`
-                        // will produce the smooth Transform from prev→curr.
+                        // Local player: ack-based reconciliation.  Drop
+                        // already-processed inputs from history, snap to the
+                        // server's authoritative position, then replay the
+                        // unacknowledged tail.  This keeps the local player
+                        // perfectly responsive (every input is felt
+                        // immediately) while staying server-authoritative —
+                        // any divergence is corrected within one snapshot
+                        // round-trip instead of accumulating.
+                        input_history.ack(np.last_processed_seq);
+
+                        // Snap transform & component state to server truth.
+                        t.translation.x = nx;
+                        t.translation.y = ny;
+                        if let Some(lp) = lp.as_mut() {
+                            lp.prev = Vec2::new(nx, ny);
+                            lp.curr = Vec2::new(nx, ny);
+                        }
+
+                        // Replay each pending input as one fixed-step tick.
+                        // We use the fixed dt (60 Hz) rather than render dt
+                        // so the replay matches the host's simulation rate
+                        // exactly — otherwise predicted pos drifts.
+                        let fixed_dt = 1.0 / crate::TICK_HZ as f32;
+                        // Take a snapshot of the queue so the borrow on
+                        // input_history doesn't conflict with mutating
+                        // player/transform inside the loop.  Cheap because
+                        // history is bounded to 240 entries (≤4 s).
+                        let pending: Vec<crate::net::NetInput> = input_history
+                            .buffer
+                            .iter()
+                            .map(|(_, inp)| *inp)
+                            .collect();
+                        for inp in &pending {
+                            apply_input_to_local(&mut t, &mut p, inp, obstacles, fixed_dt);
+                        }
                         if let Some(mut lp) = lp {
-                            lp.curr.x += (np.x - lp.curr.x) * 0.3;
-                            lp.curr.y += (np.y - lp.curr.y) * 0.3;
-                        } else {
-                            // Fallback: no LogicalPos (shouldn't happen for
-                            // the local player, but be safe).
-                            t.translation.x += (np.x - t.translation.x) * 0.3;
-                            t.translation.y += (np.y - t.translation.y) * 0.3;
+                            // Make the FixedFirst restore land on the
+                            // post-replay position so interpolation in
+                            // Update doesn't snap the avatar back.
+                            lp.curr.x = t.translation.x;
+                            lp.curr.y = t.translation.y;
+                            lp.prev = lp.curr;
                         }
                     } else {
                         // Remote player: render-time interpolation between
                         // the two history snapshots bracketing render_time.
                         // Remote players don't carry LogicalPos.
                         let target = interp_or_fallback(
-                            older_players.get(&np.id),
-                            newer_players.get(&np.id),
+                            scratch.older_players.get(&np.id),
+                            scratch.newer_players.get(&np.id),
                             alpha,
-                            (np.x, np.y),
+                            (nx, ny),
                         );
                         t.translation.x = target.x;
                         t.translation.y = target.y;
-                        t.rotation = Quat::from_rotation_z(np.rot);
+                        t.rotation = Quat::from_rotation_z(dq_rot(np.rot));
                     }
                 }
             }
             None => {
-                let pos = Vec2::new(np.x, np.y);
+                let pos = Vec2::new(dq_pos(np.x), dq_pos(np.y));
                 let ent = spawn_player_entity(&mut commands, &assets.player, np.id, pos);
                 // Only the local player gets a LogicalPos — remote players
                 // are interpolated solely via the snapshot history buffer.
@@ -576,32 +727,48 @@ fn client_apply_snapshots(
             }
         }
     }
-    despawn_stale(&mut commands, &mut net_entities.players, &seen_players);
+    // Before tearing down stale player entities, capture their last-known
+    // pose so we can fire `PlayerDiedEvent` — the death-animation listener
+    // turns it into a corpse sprite.  Without this, MP clients would just
+    // see other players pop out of existence with no visual cue.
+    for (&id, ent) in net_entities.players.iter() {
+        if scratch.seen_players.contains(&id) {
+            continue;
+        }
+        if let Ok((t, p, _)) = players.get_mut(*ent) {
+            died_evw.send(PlayerDiedEvent {
+                player_id: id,
+                pos: t.translation.truncate(),
+                aim_rot: p.aim.y.atan2(p.aim.x),
+            });
+        }
+    }
+    despawn_stale(&mut commands, &mut net_entities.players, &scratch.seen_players);
 
     // ── 6. Zombies: interpolated positions, snapped rotation ──────────────
-    let mut seen_zombies: HashSet<u32> = HashSet::new();
+    scratch.seen_zombies.clear();
     for nz in &lifecycle.zombies {
-        seen_zombies.insert(nz.id);
+        scratch.seen_zombies.insert(nz.id);
         let kind = ZombieKind::from_u8(nz.kind);
         match net_entities.zombies.get(&nz.id).copied() {
             Some(ent) => {
                 if let Ok(mut t) = zombies.get_mut(ent) {
                     let target = interp_or_fallback(
-                        older_zombies.get(&nz.id),
-                        newer_zombies.get(&nz.id),
+                        scratch.older_zombies.get(&nz.id),
+                        scratch.newer_zombies.get(&nz.id),
                         alpha,
-                        (nz.x, nz.y),
+                        (dq_pos(nz.x), dq_pos(nz.y)),
                     );
                     t.translation.x = target.x;
                     t.translation.y = target.y;
-                    t.rotation = Quat::from_rotation_z(nz.rot);
+                    t.rotation = Quat::from_rotation_z(dq_rot(nz.rot));
                 }
             }
             None => {
                 let ent = spawn_zombie_entity(
                     &mut commands,
                     &assets.zombie,
-                    Vec2::new(nz.x, nz.y),
+                    Vec2::new(dq_pos(nz.x), dq_pos(nz.y)),
                     nz.id,
                     kind.base_hp(),
                     kind.base_speed(),
@@ -611,32 +778,33 @@ fn client_apply_snapshots(
             }
         }
     }
-    despawn_stale(&mut commands, &mut net_entities.zombies, &seen_zombies);
+    despawn_stale(&mut commands, &mut net_entities.zombies, &scratch.seen_zombies);
 
     // ── 7. Bullets: interpolated positions ────────────────────────────────
-    let mut seen_bullets: HashSet<u32> = HashSet::new();
+    scratch.seen_bullets.clear();
     for nb in &lifecycle.bullets {
-        seen_bullets.insert(nb.id);
+        scratch.seen_bullets.insert(nb.id);
         match net_entities.bullets.get(&nb.id).copied() {
             Some(ent) => {
                 if let Ok(mut t) = bullets.get_mut(ent) {
                     let target = interp_or_fallback(
-                        older_bullets.get(&nb.id),
-                        newer_bullets.get(&nb.id),
+                        scratch.older_bullets.get(&nb.id),
+                        scratch.newer_bullets.get(&nb.id),
                         alpha,
-                        (nb.x, nb.y),
+                        (dq_pos(nb.x), dq_pos(nb.y)),
                     );
                     t.translation.x = target.x;
                     t.translation.y = target.y;
-                    t.rotation = Quat::from_rotation_z(nb.rot);
+                    t.rotation = Quat::from_rotation_z(dq_rot(nb.rot));
                 }
             }
             None => {
+                let rot = dq_rot(nb.rot);
                 let ent = spawn_bullet_entity(
                     &mut commands,
                     &assets.bullet,
-                    Vec2::new(nb.x, nb.y),
-                    Vec2::new(nb.rot.cos(), nb.rot.sin()),
+                    Vec2::new(dq_pos(nb.x), dq_pos(nb.y)),
+                    Vec2::new(rot.cos(), rot.sin()),
                     0.0,
                     0,
                     nb.id,
@@ -644,43 +812,49 @@ fn client_apply_snapshots(
                     false,
                     None,
                     false,
+                    0, // shooter_id — irrelevant on the client side, no auth hit-test runs here.
                 );
                 net_entities.bullets.insert(nb.id, ent);
             }
         }
     }
-    despawn_stale(&mut commands, &mut net_entities.bullets, &seen_bullets);
+    despawn_stale(&mut commands, &mut net_entities.bullets, &scratch.seen_bullets);
 
     // ── 8. Pickups: spawn-only (static positions) ─────────────────────────
-    let mut seen_pickups: HashSet<u32> = HashSet::new();
-    for np in &lifecycle.pickups {
-        seen_pickups.insert(np.id);
+    // Skip the whole section when host signalled "no change" (None).  Without
+    // this guard `despawn_stale` would clear every pickup the moment we get
+    // a delta snapshot — they aren't in `lifecycle.pickups` because the host
+    // omitted the field.
+    if let Some(snap_pickups) = lifecycle.pickups.as_ref() {
+    scratch.seen_pickups.clear();
+    for np in snap_pickups {
+        scratch.seen_pickups.insert(np.id);
         use std::collections::hash_map::Entry;
         if let Entry::Vacant(entry) = net_entities.pickups.entry(np.id) {
             let ent = match np.kind {
                 HEALTH_PICKUP_KIND => spawn_health_entity(
                     &mut commands,
                     &assets.extra,
-                    Vec2::new(np.x, np.y),
+                    Vec2::new(dq_pos(np.x), dq_pos(np.y)),
                     np.id,
                 ),
                 ARMOR_PICKUP_KIND => spawn_armor_entity(
                     &mut commands,
                     &assets.extra,
-                    Vec2::new(np.x, np.y),
+                    Vec2::new(dq_pos(np.x), dq_pos(np.y)),
                     np.id,
                 ),
                 MONEY2X_PICKUP_KIND => spawn_money_entity(
                     &mut commands,
                     &assets.extra,
-                    Vec2::new(np.x, np.y),
+                    Vec2::new(dq_pos(np.x), dq_pos(np.y)),
                     2,
                     np.id,
                 ),
                 MONEY3X_PICKUP_KIND => spawn_money_entity(
                     &mut commands,
                     &assets.extra,
-                    Vec2::new(np.x, np.y),
+                    Vec2::new(dq_pos(np.x), dq_pos(np.y)),
                     3,
                     np.id,
                 ),
@@ -689,7 +863,7 @@ fn client_apply_snapshots(
                     spawn_pickup_entity(
                         &mut commands,
                         &assets.weapon,
-                        Vec2::new(np.x, np.y),
+                        Vec2::new(dq_pos(np.x), dq_pos(np.y)),
                         kind,
                         np.id,
                     )
@@ -698,36 +872,39 @@ fn client_apply_snapshots(
             entry.insert(ent);
         }
     }
-    despawn_stale(&mut commands, &mut net_entities.pickups, &seen_pickups);
+    despawn_stale(&mut commands, &mut net_entities.pickups, &scratch.seen_pickups);
+    } // end "if let Some(snap_pickups)"
 
     // ── 9. Explosions: anim state from latest ─────────────────────────────
-    let mut seen_explosions: HashSet<u32> = HashSet::new();
+    scratch.seen_explosions.clear();
     for ne in &lifecycle.explosions {
-        seen_explosions.insert(ne.id);
+        scratch.seen_explosions.insert(ne.id);
         match net_entities.explosions.get(&ne.id).copied() {
             Some(ent) => {
                 if let Ok((mut exp, mut sprite)) = explosions.get_mut(ent) {
-                    exp.lifetime = ne.remaining;
-                    exp.radius = ne.radius;
-                    let t = (ne.remaining / EXPLOSION_LIFETIME).clamp(0.0, 1.0);
+                    let remaining = (ne.remaining_ms as f32) / 1000.0;
+                    let radius = dq_radius(ne.radius);
+                    exp.lifetime = remaining;
+                    exp.radius = radius;
+                    let t = (remaining / EXPLOSION_LIFETIME).clamp(0.0, 1.0);
                     let phase = 1.0 - t;
                     let scale = 1.1 + phase * 1.0;
-                    sprite.custom_size = Some(Vec2::splat(ne.radius * scale));
+                    sprite.custom_size = Some(Vec2::splat(radius * scale));
                 }
             }
             None => {
                 let ent = spawn_explosion_entity(
                     &mut commands,
                     &assets.bullet,
-                    Vec2::new(ne.x, ne.y),
-                    ne.radius,
+                    Vec2::new(dq_pos(ne.x), dq_pos(ne.y)),
+                    dq_radius(ne.radius),
                     ne.id,
                 );
                 net_entities.explosions.insert(ne.id, ent);
             }
         }
     }
-    despawn_stale(&mut commands, &mut net_entities.explosions, &seen_explosions);
+    despawn_stale(&mut commands, &mut net_entities.explosions, &scratch.seen_explosions);
 
     if lifecycle.game_over {
         next_state.set(GameState::GameOver);

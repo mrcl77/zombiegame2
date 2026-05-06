@@ -1,10 +1,13 @@
 mod achievements;
 mod audio;
 mod bullet;
+mod chat;
 mod elevator;
 mod lobby;
 mod map;
 mod map_data;
+mod map_nav;
+mod map_obstacles;
 mod menu;
 mod net;
 mod pause;
@@ -13,6 +16,7 @@ mod player;
 mod settings;
 mod sync;
 mod ui;
+mod underground;
 mod wave;
 mod weapon;
 mod world_consts;
@@ -137,6 +141,8 @@ fn main() {
             achievements::AchievementsPlugin,
             audio::AudioFxPlugin,
             ui::UiPlugin,
+            chat::ChatPlugin,
+            underground::UndergroundPlugin,
         ))
         .add_systems(Startup, setup_camera)
         .add_systems(
@@ -210,11 +216,43 @@ fn camera_follow(
     };
     let view_w = FIXED_VIEW_H * aspect;
 
-    let max_x = (MAP_WIDTH / 2.0 - view_w / 2.0).max(0.0);
-    let max_y = (MAP_HEIGHT / 2.0 - FIXED_VIEW_H / 2.0).max(0.0);
+    let half_view_w = view_w * 0.5;
+    let half_view_h = FIXED_VIEW_H / 2.0;
 
-    let base_x = target.x.clamp(-max_x, max_x);
-    let base_y = target.y.clamp(-max_y, max_y);
+    // Camera clamp is context-dependent: while the player is on the
+    // surface we clamp to the surface map rect; once they descend below
+    // the surface south boundary we switch to the underground rect so
+    // neither the void above the metro nor the empty space east/west of
+    // its bounding box ever enters frame.
+    let (min_x, max_x, min_y, max_y) = if target.y < -crate::map::MAP_HEIGHT * 0.5 {
+        // Underground bounds (metro platform + tracks).
+        let lo_x = crate::underground::UNDER_LEFT + half_view_w;
+        let hi_x = crate::underground::UNDER_RIGHT - half_view_w;
+        let lo_y = crate::underground::UNDER_BOTTOM + half_view_h;
+        let hi_y = crate::underground::UNDER_TOP - half_view_h;
+        // If the metro is narrower than the viewport, lock the camera to
+        // its centre instead of producing an inverted clamp range.
+        let (mn_x, mx_x) = if hi_x >= lo_x {
+            (lo_x, hi_x)
+        } else {
+            let cx = crate::underground::UNDER_CX;
+            (cx, cx)
+        };
+        let (mn_y, mx_y) = if hi_y >= lo_y {
+            (lo_y, hi_y)
+        } else {
+            let cy = crate::underground::UNDER_CY;
+            (cy, cy)
+        };
+        (mn_x, mx_x, mn_y, mx_y)
+    } else {
+        let surf_x = (MAP_WIDTH / 2.0 - half_view_w).max(0.0);
+        let surf_y = (MAP_HEIGHT / 2.0 - half_view_h).max(0.0);
+        (-surf_x, surf_x, -surf_y, surf_y)
+    };
+
+    let base_x = target.x.clamp(min_x, max_x);
+    let base_y = target.y.clamp(min_y, max_y);
 
     // Apply screen shake — random offset proportional to intensity.  Decay
     // exponentially so big hits punch hard and fade smoothly.

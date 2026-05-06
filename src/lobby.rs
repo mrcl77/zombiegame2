@@ -168,7 +168,7 @@ fn poll_host_lobby_events(
             ServerEvent::Hello { id, nickname } => {
                 nicknames.0.insert(id, nickname);
             }
-            ServerEvent::Input { .. } => {}
+            ServerEvent::Input { .. } | ServerEvent::ChatRelay { .. } => {}
         }
     }
 }
@@ -202,8 +202,12 @@ fn poll_client_lobby_events(
             ClientInEvent::Started => {
                 next_state.set(GameState::Playing);
             }
-            ClientInEvent::Snapshot(_) => {}
-            ClientInEvent::Disconnected | ClientInEvent::FullLobby => {
+            ClientInEvent::Snapshot(_) | ClientInEvent::Chat { .. } => {}
+            ClientInEvent::Disconnected
+            | ClientInEvent::FullLobby
+            | ClientInEvent::ProtocolMismatch { .. } => {
+                // Treat protocol mismatch like a disconnect at the lobby
+                // level — caller will see "back at menu" and can reconnect.
                 ctx.disconnect();
                 *mode = NetMode::SinglePlayer;
                 next_state.set(GameState::Menu);

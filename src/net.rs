@@ -11,12 +11,67 @@ use std::time::Duration;
 
 pub const NET_PORT: u16 = 7777;
 pub const MAX_PLAYERS: u8 = 4;
-pub const MAX_MSG_SIZE: usize = 1_048_576;
+/// Snapshot bandwidth ceiling — server→client only.  Big snapshots can hit
+/// ~10-20 KB legitimately; 256 KB is comfortably above the worst case while
+/// still preventing a malformed length field from triggering a multi-MB alloc.
+pub const MAX_MSG_SIZE: usize = 256 * 1024;
+/// Tighter cap for client→server messages (just inputs + Hello/Leave) — these
+/// don't legitimately exceed a few hundred bytes, so we can be aggressive.
+pub const MAX_CLIENT_MSG_SIZE: usize = 4 * 1024;
+/// Drop the connection if a client exceeds this many messages per second.
+/// Inputs flow at 60 Hz, so 120 leaves comfortable headroom for bursts.
+pub const CLIENT_MSG_RATE_LIMIT: u32 = 120;
+/// Hard timeout for completing the initial `Hello` handshake.  Connections
+/// that just hold the socket open without sending anything are dropped.
+pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+/// Network protocol version — bumped on any wire-format change.  Clients with
+/// a mismatched version are rejected at connect time so they don't trigger
+/// `bincode::deserialize` panics on a wrong-shape struct.
+pub const PROTOCOL_VERSION: u16 = 4;
+
+/// Hard limit on a single chat line.  80 chars is wide enough to be useful
+/// without enabling spam.  Enforced on both the client send path and the
+/// server relay path so a bad actor can't bypass it.
+pub const CHAT_MAX_LEN: usize = 80;
+
+/// Trim, restrict to printable ASCII, cap at `CHAT_MAX_LEN`.  Returns `None`
+/// if nothing usable remains so callers can drop empty messages.
+pub fn sanitize_chat(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(CHAT_MAX_LEN);
+    for c in trimmed.chars() {
+        if out.chars().count() >= CHAT_MAX_LEN {
+            break;
+        }
+        // Keep printable ASCII (space + visible glyphs).  Strips control
+        // chars / non-ASCII so the renderer (PressStart2P) doesn't draw
+        // tofu boxes.
+        if c == ' ' || (c.is_ascii_graphic()) {
+            out.push(c);
+        }
+    }
+    if out.trim().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ClientMsg {
-    Hello { nickname: String },
+    /// Handshake: client announces itself + the protocol version it speaks.
+    /// Server hangs up if the version doesn't match `PROTOCOL_VERSION`.
+    Hello {
+        nickname: String,
+        protocol_version: u16,
+    },
     Input(NetInput),
+    Chat {
+        text: String,
+    },
     Leave,
 }
 
@@ -41,11 +96,17 @@ pub fn sanitize_nickname(input: &str) -> String {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ServerMsg {
-    Welcome { your_id: u8 },
+    Welcome { your_id: u8, protocol_version: u16 },
     LobbyState { players: Vec<u8> },
     StartGame,
     Snapshot(Box<NetSnapshot>),
     FullLobby,
+    /// Sent when a client's protocol version doesn't match the server.
+    ProtocolMismatch { server_version: u16 },
+    /// Server-relayed chat line.  Author resolved to a display name on the
+    /// host (from `PlayerNicknames` / `LocalNickname`) so receivers don't
+    /// need a nickname-table lookup.
+    Chat { author: String, text: String },
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
@@ -61,7 +122,66 @@ pub struct NetInput {
     /// True for the single tick when the player presses the interact key (E)
     /// — used by the segment-unlock system to detect a manual purchase.
     pub interact: bool,
+    /// True for as long as the interact key is held down — used by the
+    /// revive system, which needs hold-progress rather than a one-shot.
+    pub interact_held: bool,
+    /// Monotonic per-client input sequence number.  The server echoes the
+    /// last sequence it applied for that client back in `NetPlayerState`,
+    /// which lets the client drop already-processed inputs from its
+    /// history buffer and replay only the unacknowledged ones after each
+    /// authoritative snapshot.  Wraps after ~135 years at 60 Hz.
+    pub seq: u32,
 }
+
+impl NetInput {
+    /// Strip NaN / infinite floats and clamp magnitudes so a malicious or
+    /// buggy client cannot poison the server simulation (`pos += NaN`
+    /// permanently breaks the player's transform).  Called on every input
+    /// the host receives.  Movement is normalised post-clamp by the
+    /// existing per-tick `mv.normalize()` path; aim must stay non-zero so
+    /// we leave the previous value untouched if the new one is unusable.
+    pub fn sanitize(&mut self) {
+        let san = |f: f32| if f.is_finite() { f.clamp(-1.5, 1.5) } else { 0.0 };
+        self.move_x = san(self.move_x);
+        self.move_y = san(self.move_y);
+        // Aim: only overwrite with sanitised values if magnitude is reasonable;
+        // otherwise zero it so the server-side fallback (`player.aim` previous
+        // value) kicks in.
+        let ax = san(self.aim_x);
+        let ay = san(self.aim_y);
+        if (ax * ax + ay * ay) > 0.0001 {
+            self.aim_x = ax;
+            self.aim_y = ay;
+        } else {
+            self.aim_x = 0.0;
+            self.aim_y = 0.0;
+        }
+        // Slot: only 0..=3 are meaningful.
+        if self.switch_slot > 3 {
+            self.switch_slot = 0;
+        }
+    }
+}
+
+/// Position quantisation factor.  1/8 px precision, range ±4096 px (mapa
+/// max half-extent 3840 px ≤ 4096, więc full mapa się mieści w i16 bez
+/// utraty informacji nieosiągalnej dla gracza).
+const POS_Q: f32 = 8.0;
+/// Rotation quantisation: i16 reprezentuje radiany * 10000 (≈0.0001 rad
+/// precyzji = ~0.006°).  Wystarczy dla aimu / sprite rotation.
+const ROT_Q: f32 = 10000.0;
+
+#[inline] pub fn q_pos(v: f32) -> i16 { (v * POS_Q).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16 }
+#[inline] pub fn dq_pos(q: i16) -> f32 { q as f32 / POS_Q }
+#[inline] pub fn q_rot(r: f32) -> i16 {
+    if !r.is_finite() { return 0; }
+    (r * ROT_Q).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
+}
+#[inline] pub fn dq_rot(q: i16) -> f32 { q as f32 / ROT_Q }
+/// Radii (eksplozje, bullety) — quantyzacja taka sama jak pozycji ale unsigned
+/// (max 8191 px ≈ więcej niż największa eksplozja w grze).
+#[inline] pub fn q_radius(v: f32) -> u16 { (v * POS_Q).round().clamp(0.0, u16::MAX as f32) as u16 }
+#[inline] pub fn dq_radius(q: u16) -> f32 { q as f32 / POS_Q }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct NetSnapshot {
@@ -69,66 +189,80 @@ pub struct NetSnapshot {
     pub players: Vec<NetPlayerState>,
     pub zombies: Vec<NetZombieState>,
     pub bullets: Vec<NetBulletState>,
-    pub pickups: Vec<NetPickupState>,
+    /// `None` = pickups didn't change since the previous snapshot — client
+    /// keeps its existing entities.  Pickups are static (no movement, just
+    /// spawn/despawn) so the host can reliably detect "no change" by hashing
+    /// the id-set.  Saves ~14 B × 28 pickups ≈ 400 B per snapshot when stable.
+    pub pickups: Option<Vec<NetPickupState>>,
     pub explosions: Vec<NetExplosionState>,
     pub score: u32,
     pub wave: u32,
     pub in_break: bool,
-    pub break_secs: f32,
+    /// Pozostały czas przerwy w milisekundach — max 65 s (przerwa to ~2.5 s,
+    /// więc bardzo dużo zapasu).  Klient odbudowuje z `break_ms / 1000.0`.
+    pub break_ms: u16,
     pub zombies_to_spawn: u32,
     pub game_over: bool,
     /// Bitmask: bit `i` set ⇒ map segment with idx `i` is unlocked.
     /// Bit 0 (starting area) is always 1.
     pub unlocked_segments_mask: u8,
-    /// Player id → nickname.  Sparse map — only joined players included.
-    pub player_nicknames: Vec<(u8, String)>,
+    /// `None` = nicknames didn't change.  Population only changes on
+    /// connect/disconnect, so empty most of the game.  Saves ~12-40 B per
+    /// snapshot once players have introduced themselves.
+    pub player_nicknames: Option<Vec<(u8, String)>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct NetPlayerState {
     pub id: u8,
-    pub x: f32,
-    pub y: f32,
-    pub rot: f32,
-    pub hp: i32,
-    pub armor: i32,
+    pub x: i16,
+    pub y: i16,
+    pub rot: i16,
+    pub hp: i16,
+    pub armor: i16,
     pub active_slot: u8,
     pub slot1_weapon: u8, // 255 = None
+    /// Last input sequence number the server applied for this client.
+    /// Used for input-replay reconciliation on the owning client; remote
+    /// clients ignore this field.
+    pub last_processed_seq: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct NetZombieState {
     pub id: u32,
-    pub x: f32,
-    pub y: f32,
-    pub rot: f32,
+    pub x: i16,
+    pub y: i16,
+    pub rot: i16,
     pub kind: u8,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct NetBulletState {
     pub id: u32,
-    pub x: f32,
-    pub y: f32,
-    pub rot: f32,
+    pub x: i16,
+    pub y: i16,
+    pub rot: i16,
     pub is_rocket: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct NetPickupState {
     pub id: u32,
-    pub x: f32,
-    pub y: f32,
+    pub x: i16,
+    pub y: i16,
     pub kind: u8,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct NetExplosionState {
     pub id: u32,
-    pub x: f32,
-    pub y: f32,
-    pub radius: f32,
-    pub remaining: f32,
+    pub x: i16,
+    pub y: i16,
+    pub radius: u16,
+    /// Pozostały czas eksplozji w milisekundach (max 65s — eksplozje żyją
+    /// ~0.4 s, więc tylko niewielki ułamek zakresu).
+    pub remaining_ms: u16,
 }
 
 #[derive(Resource, Default, PartialEq, Eq, Clone, Copy, Debug)]
@@ -144,6 +278,9 @@ pub enum ServerEvent {
     Hello { id: u8, nickname: String },
     Disconnected { id: u8 },
     Input { id: u8, input: NetInput },
+    /// Raw chat submission from a connected client — host resolves the
+    /// author nickname before broadcasting `ServerMsg::Chat`.
+    ChatRelay { id: u8, text: String },
 }
 
 pub enum ClientInEvent {
@@ -153,6 +290,12 @@ pub enum ClientInEvent {
     Snapshot(Box<NetSnapshot>),
     Disconnected,
     FullLobby,
+    ProtocolMismatch {
+        #[allow(dead_code)] // Surfaced for future UI display of mismatch
+        server_version: u16,
+    },
+    /// Chat line broadcast from the host.
+    Chat { author: String, text: String },
 }
 
 pub struct HostConn {
@@ -269,10 +412,17 @@ fn write_msg<T: Serialize>(stream: &mut TcpStream, msg: &T) -> std::io::Result<(
 }
 
 fn read_msg<T: for<'de> Deserialize<'de>>(stream: &mut TcpStream) -> std::io::Result<T> {
+    read_msg_with_limit(stream, MAX_MSG_SIZE)
+}
+
+fn read_msg_with_limit<T: for<'de> Deserialize<'de>>(
+    stream: &mut TcpStream,
+    max_len: usize,
+) -> std::io::Result<T> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len == 0 || len > MAX_MSG_SIZE {
+    if len == 0 || len > max_len {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "bad length",
@@ -323,6 +473,42 @@ pub fn start_host() -> std::io::Result<HostConn> {
                 continue;
             }
 
+            // Handshake: require Hello with matching protocol version
+            // before allocating an id / spawning reader+writer threads.
+            // Bound by HELLO_TIMEOUT so a client that opens the socket and
+            // never sends anything can't squat resources.
+            let mut handshake_stream = match stream.try_clone() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let _ = handshake_stream.set_read_timeout(Some(HELLO_TIMEOUT));
+            let hello = match read_msg_with_limit::<ClientMsg>(
+                &mut handshake_stream,
+                MAX_CLIENT_MSG_SIZE,
+            ) {
+                Ok(ClientMsg::Hello { nickname, protocol_version }) => {
+                    if protocol_version != PROTOCOL_VERSION {
+                        let _ = write_msg(
+                            &mut handshake_stream,
+                            &ServerMsg::ProtocolMismatch {
+                                server_version: PROTOCOL_VERSION,
+                            },
+                        );
+                        let _ = handshake_stream.shutdown(std::net::Shutdown::Both);
+                        continue;
+                    }
+                    sanitize_nickname(&nickname)
+                }
+                _ => {
+                    // Wrong message kind, malformed payload, or timeout —
+                    // drop without leaking an id.
+                    let _ = handshake_stream.shutdown(std::net::Shutdown::Both);
+                    continue;
+                }
+            };
+            // Restore blocking, no-timeout reads for the steady-state stream.
+            let _ = handshake_stream.set_read_timeout(None);
+
             let id = next_id;
             next_id = next_id.wrapping_add(1);
 
@@ -330,13 +516,25 @@ pub fn start_host() -> std::io::Result<HostConn> {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            if write_msg(&mut welcome_stream, &ServerMsg::Welcome { your_id: id }).is_err() {
+            if write_msg(
+                &mut welcome_stream,
+                &ServerMsg::Welcome {
+                    your_id: id,
+                    protocol_version: PROTOCOL_VERSION,
+                },
+            )
+            .is_err()
+            {
                 continue;
             }
 
             let (out_tx, out_rx) = channel::<ServerMsg>();
             senders_clone.lock().unwrap_or_else(|e| e.into_inner()).insert(id, out_tx);
             let _ = event_tx_clone.send(ServerEvent::Connected { id });
+            let _ = event_tx_clone.send(ServerEvent::Hello {
+                id,
+                nickname: hello,
+            });
 
             let mut writer_stream = match stream.try_clone() {
                 Ok(s) => s,
@@ -354,30 +552,80 @@ pub fn start_host() -> std::io::Result<HostConn> {
             let reader_event_tx = event_tx_clone.clone();
             let reader_senders = senders_clone.clone();
             let mut reader_stream = stream;
-            thread::spawn(move || loop {
-                match read_msg::<ClientMsg>(&mut reader_stream) {
-                    Ok(ClientMsg::Input(input)) => {
-                        if reader_event_tx
-                            .send(ServerEvent::Input { id, input })
-                            .is_err()
-                        {
+            thread::spawn(move || {
+                use std::time::Instant;
+                let mut window_start = Instant::now();
+                let mut window_count: u32 = 0;
+                loop {
+                    // Rate-limit: if a client sends > CLIENT_MSG_RATE_LIMIT
+                    // messages in any rolling 1-second window, drop them.
+                    let now = Instant::now();
+                    if now.duration_since(window_start) >= Duration::from_secs(1) {
+                        window_start = now;
+                        window_count = 0;
+                    }
+                    match read_msg_with_limit::<ClientMsg>(
+                        &mut reader_stream,
+                        MAX_CLIENT_MSG_SIZE,
+                    ) {
+                        Ok(msg) => {
+                            window_count += 1;
+                            if window_count > CLIENT_MSG_RATE_LIMIT {
+                                // Spammy client — terminate.
+                                reader_senders
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .remove(&id);
+                                let _ = reader_event_tx
+                                    .send(ServerEvent::Disconnected { id });
+                                break;
+                            }
+                            match msg {
+                                ClientMsg::Input(input) => {
+                                    if reader_event_tx
+                                        .send(ServerEvent::Input { id, input })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                ClientMsg::Hello { nickname, .. } => {
+                                    // Late re-Hello (client renamed itself) —
+                                    // accept the new nickname; protocol version
+                                    // is already validated.
+                                    let clean = sanitize_nickname(&nickname);
+                                    let _ = reader_event_tx
+                                        .send(ServerEvent::Hello { id, nickname: clean });
+                                }
+                                ClientMsg::Chat { text } => {
+                                    if let Some(clean) = sanitize_chat(&text) {
+                                        if reader_event_tx
+                                            .send(ServerEvent::ChatRelay { id, text: clean })
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                                ClientMsg::Leave => {
+                                    reader_senders
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .remove(&id);
+                                    let _ = reader_event_tx
+                                        .send(ServerEvent::Disconnected { id });
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            reader_senders
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove(&id);
+                            let _ = reader_event_tx.send(ServerEvent::Disconnected { id });
                             break;
                         }
-                    }
-                    Ok(ClientMsg::Hello { nickname }) => {
-                        let clean = sanitize_nickname(&nickname);
-                        let _ = reader_event_tx
-                            .send(ServerEvent::Hello { id, nickname: clean });
-                    }
-                    Ok(ClientMsg::Leave) => {
-                        reader_senders.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-                        let _ = reader_event_tx.send(ServerEvent::Disconnected { id });
-                        break;
-                    }
-                    Err(_) => {
-                        reader_senders.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-                        let _ = reader_event_tx.send(ServerEvent::Disconnected { id });
-                        break;
                     }
                 }
             });
@@ -404,6 +652,7 @@ pub fn start_client(addr: SocketAddr, nickname: &str) -> std::io::Result<ClientC
         &mut hello_stream,
         &ClientMsg::Hello {
             nickname: clean_nick,
+            protocol_version: PROTOCOL_VERSION,
         },
     )?;
 
@@ -421,7 +670,14 @@ pub fn start_client(addr: SocketAddr, nickname: &str) -> std::io::Result<ClientC
     let mut reader_stream = stream;
     thread::spawn(move || loop {
         match read_msg::<ServerMsg>(&mut reader_stream) {
-            Ok(ServerMsg::Welcome { your_id }) => {
+            Ok(ServerMsg::Welcome { your_id, protocol_version }) => {
+                if protocol_version != PROTOCOL_VERSION {
+                    // Server speaks a different protocol than we expected.
+                    let _ = reader_event_tx.send(ClientInEvent::ProtocolMismatch {
+                        server_version: protocol_version,
+                    });
+                    break;
+                }
                 if reader_event_tx
                     .send(ClientInEvent::Welcomed { your_id })
                     .is_err()
@@ -450,6 +706,20 @@ pub fn start_client(addr: SocketAddr, nickname: &str) -> std::io::Result<ClientC
             Ok(ServerMsg::FullLobby) => {
                 let _ = reader_event_tx.send(ClientInEvent::FullLobby);
                 break;
+            }
+            Ok(ServerMsg::ProtocolMismatch { server_version }) => {
+                let _ = reader_event_tx.send(ClientInEvent::ProtocolMismatch {
+                    server_version,
+                });
+                break;
+            }
+            Ok(ServerMsg::Chat { author, text }) => {
+                if reader_event_tx
+                    .send(ClientInEvent::Chat { author, text })
+                    .is_err()
+                {
+                    break;
+                }
             }
             Err(_) => {
                 let _ = reader_event_tx.send(ClientInEvent::Disconnected);
@@ -494,5 +764,102 @@ impl Plugin for NetPlugin {
             .init_resource::<NetEntities>()
             .init_resource::<LocalNickname>()
             .init_resource::<PlayerNicknames>();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_nickname_clamps_and_uppercases() {
+        assert_eq!(sanitize_nickname("alice"), "ALICE");
+        assert_eq!(sanitize_nickname("  bob "), "BOB");
+        assert_eq!(sanitize_nickname(""), "GRACZ");
+        // Strips non-alphanumeric.
+        assert_eq!(sanitize_nickname("hi!@#"), "HI");
+        // Truncates to NICKNAME_MAX_LEN (10) characters.
+        assert_eq!(sanitize_nickname("abcdefghijklmnop"), "ABCDEFGHIJ");
+        assert_eq!(sanitize_nickname("abcdefghijklmnop").chars().count(), NICKNAME_MAX_LEN);
+    }
+
+    #[test]
+    fn netinput_sanitize_rejects_nan_and_inf() {
+        // Movement: NaN/Inf → 0.  Aim: NaN component zeroed; if the
+        // remaining magnitude is non-trivial we keep the partial vector.
+        let mut i = NetInput {
+            move_x: f32::NAN,
+            move_y: f32::INFINITY,
+            aim_x: f32::NEG_INFINITY,
+            aim_y: 0.5,
+            switch_slot: 99,
+            ..Default::default()
+        };
+        i.sanitize();
+        assert_eq!(i.move_x, 0.0);
+        assert_eq!(i.move_y, 0.0);
+        // aim_x sanitised to 0; aim_y survives at 0.5 (magnitude 0.25 > eps).
+        assert_eq!(i.aim_x, 0.0);
+        assert_eq!(i.aim_y, 0.5);
+        assert_eq!(i.switch_slot, 0); // out-of-range slot reset.
+    }
+
+    #[test]
+    fn netinput_sanitize_zeros_aim_when_both_axes_invalid() {
+        // Both aim axes garbage ⇒ magnitude < eps ⇒ both zeroed.
+        let mut i = NetInput {
+            aim_x: f32::NAN,
+            aim_y: f32::INFINITY,
+            ..Default::default()
+        };
+        i.sanitize();
+        assert_eq!(i.aim_x, 0.0);
+        assert_eq!(i.aim_y, 0.0);
+    }
+
+    #[test]
+    fn netinput_sanitize_clamps_oversized_movement() {
+        let mut i = NetInput {
+            move_x: 5.0,
+            move_y: -10.0,
+            aim_x: 0.7,
+            aim_y: 0.7,
+            switch_slot: 2,
+            ..Default::default()
+        };
+        i.sanitize();
+        assert!((i.move_x - 1.5).abs() < 1e-6, "move_x should clamp to 1.5");
+        assert!((i.move_y - -1.5).abs() < 1e-6, "move_y should clamp to -1.5");
+        assert!((i.aim_x - 0.7).abs() < 1e-6);
+        assert!((i.aim_y - 0.7).abs() < 1e-6);
+        assert_eq!(i.switch_slot, 2);
+    }
+
+    #[test]
+    fn quantization_round_trips_to_within_one_eighth_pixel() {
+        for &v in &[-3840.0, -1234.5, 0.0, 0.4, 1234.5, 3840.0] {
+            let q = q_pos(v);
+            let dq = dq_pos(q);
+            assert!((dq - v).abs() <= 1.0 / POS_Q + 1e-3,
+                "value {v} round-tripped to {dq}");
+        }
+    }
+
+    #[test]
+    fn rotation_quantization_handles_full_circle() {
+        use std::f32::consts::PI;
+        for &v in &[-PI, -1.0, 0.0, 1.0, PI] {
+            let q = q_rot(v);
+            let dq = dq_rot(q);
+            assert!((dq - v).abs() < 1e-3, "rot {v} round-tripped to {dq}");
+        }
+        // NaN should be silently zeroed (not panic, not propagate).
+        assert_eq!(q_rot(f32::NAN), 0);
+    }
+
+    #[test]
+    fn radius_quantization_clamps_negatives_to_zero() {
+        assert_eq!(q_radius(-5.0), 0);
+        assert_eq!(dq_radius(q_radius(50.0)), 50.0);
     }
 }

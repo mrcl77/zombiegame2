@@ -941,6 +941,27 @@ fn despawn_hud(mut commands: Commands, q: Query<Entity, With<HudRoot>>) {
     }
 }
 
+/// Cached scalar HUD state — the formatter is the expensive bit
+/// (`format!` builds a fresh `String` every time), so we only re-format
+/// when the underlying value actually changed.  Each field is `Option`
+/// so the first frame of a play session always re-renders.
+#[derive(Default)]
+struct HudCache {
+    hp: Option<i32>,
+    armor: Option<i32>,
+    score: Option<u32>,
+    wave: Option<u32>,
+    in_break: Option<bool>,
+    /// `(active_slot, weapon_id_or_throwable)` so a slot switch invalidates.
+    weapon: Option<(u8, u8)>,
+    ammo: Option<(u32, u32, u32, bool)>, // (ammo, mag, reserve, reloading)
+    /// Tenths-of-seconds for the break countdown — keeps formatting at ~10 Hz
+    /// rather than per-frame even though the float value drifts every tick.
+    break_tenths: Option<u32>,
+    zombies_left: Option<usize>,
+    throwable_count: Option<u32>,
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn update_hud(
     ctx: Res<NetContext>,
@@ -948,6 +969,7 @@ fn update_hud(
     score: Res<Score>,
     wave: Res<WaveState>,
     zombies: Query<(), With<Zombie>>,
+    mut cache: Local<HudCache>,
     mut bars: ParamSet<(
         Query<&mut Style, With<HpBarFill>>,
         Query<&mut Style, With<ArmorBarFill>>,
@@ -1049,63 +1071,122 @@ fn update_hud(
     if let Ok(mut style) = bars.p1().get_single_mut() {
         style.width = Val::Percent(armor_pct);
     }
-    if let Ok(mut text) = hp_text.get_single_mut() {
-        text.sections[0].value = format!("{}", player.hp.max(0));
+    let hp_now = player.hp.max(0);
+    if cache.hp != Some(hp_now) {
+        cache.hp = Some(hp_now);
+        if let Ok(mut text) = hp_text.get_single_mut() {
+            text.sections[0].value = format!("{}", hp_now);
+        }
     }
-    if let Ok(mut text) = armor_text.get_single_mut() {
-        text.sections[0].value = format!("{}", player.armor.max(0));
+    let armor_now = player.armor.max(0);
+    if cache.armor != Some(armor_now) {
+        cache.armor = Some(armor_now);
+        if let Ok(mut text) = armor_text.get_single_mut() {
+            text.sections[0].value = format!("{}", armor_now);
+        }
     }
     // Weapon / slot display
-    if let Ok(mut text) = weapon_text.get_single_mut() {
-        let slot = player.active_slot;
-        if slot <= 1 {
-            let label = player.active_weapon().label();
-            text.sections[0].value = format!("[{}] {}", slot + 1, label);
-        } else {
-            text.sections[0].value = format!("[3] {}", player.throwable_kind.label());
+    let weapon_key = if player.active_slot <= 1 {
+        (player.active_slot, player.active_weapon().as_u8())
+    } else {
+        // Distinct namespace for throwables so we don't clash with weapon ids.
+        (2, 0xF0 | player.throwable_kind as u8)
+    };
+    if cache.weapon != Some(weapon_key) {
+        cache.weapon = Some(weapon_key);
+        if let Ok(mut text) = weapon_text.get_single_mut() {
+            let slot = player.active_slot;
+            if slot <= 1 {
+                text.sections[0].value =
+                    format!("[{}] {}", slot + 1, player.active_weapon().label());
+            } else {
+                text.sections[0].value = format!("[3] {}", player.throwable_kind.label());
+            }
         }
     }
     // Ammo display
-    if let Ok(mut text) = ammo_text.get_single_mut() {
+    let ammo_now = if player.active_slot <= 1 {
         let slot = player.active_slot as usize;
-        if slot <= 1 {
-            let weapon = player.active_weapon();
-            if weapon.has_infinite_ammo() {
-                text.sections[0].value = "INF".to_string();
-            } else if player.reload_timer > 0.0 {
-                text.sections[0].value = "RELOADING...".to_string();
+        let weapon = player.active_weapon();
+        (
+            player.ammo[slot],
+            weapon.magazine_size(),
+            player.reserve_ammo[slot],
+            player.reload_timer > 0.0,
+        )
+    } else {
+        // Throwable slot — encode count in the reserve field, force "non-reloading".
+        (player.throwable_count, 0, 0, false)
+    };
+    let throwable_now = if player.active_slot > 1 {
+        Some(player.throwable_count)
+    } else {
+        None
+    };
+    if cache.ammo != Some(ammo_now) || cache.throwable_count != throwable_now {
+        cache.ammo = Some(ammo_now);
+        cache.throwable_count = throwable_now;
+        if let Ok(mut text) = ammo_text.get_single_mut() {
+            let slot = player.active_slot as usize;
+            if slot <= 1 {
+                let weapon = player.active_weapon();
+                if weapon.has_infinite_ammo() {
+                    text.sections[0].value = "INF".to_string();
+                } else if player.reload_timer > 0.0 {
+                    text.sections[0].value = "RELOADING...".to_string();
+                } else {
+                    text.sections[0].value = format!(
+                        "{}/{}  [{}]",
+                        player.ammo[slot],
+                        weapon.magazine_size(),
+                        player.reserve_ammo[slot],
+                    );
+                }
             } else {
-                text.sections[0].value = format!(
-                    "{}/{}  [{}]",
-                    player.ammo[slot],
-                    weapon.magazine_size(),
-                    player.reserve_ammo[slot],
-                );
+                text.sections[0].value = format!("x{}", player.throwable_count);
             }
-        } else {
-            text.sections[0].value = format!("x{}", player.throwable_count);
         }
     }
-    if let Ok(mut text) = wave_title.get_single_mut() {
-        text.sections[0].value = if wave.in_break && wave.current_wave == 0 {
-            "GET READY".to_string()
-        } else if wave.in_break {
-            format!("WAVE {} IN...", wave.current_wave + 1)
-        } else {
-            format!("WAVE {}", wave.current_wave)
-        };
+    if cache.wave != Some(wave.current_wave) || cache.in_break != Some(wave.in_break) {
+        cache.wave = Some(wave.current_wave);
+        cache.in_break = Some(wave.in_break);
+        if let Ok(mut text) = wave_title.get_single_mut() {
+            text.sections[0].value = if wave.in_break && wave.current_wave == 0 {
+                "GET READY".to_string()
+            } else if wave.in_break {
+                format!("WAVE {} IN...", wave.current_wave + 1)
+            } else {
+                format!("WAVE {}", wave.current_wave)
+            };
+        }
     }
-    if let Ok(mut text) = wave_status.get_single_mut() {
-        text.sections[0].value = if wave.in_break {
-            format!("{:.1}s", wave.break_timer.remaining_secs())
-        } else {
-            let alive = zombies.iter().count();
-            let left = wave.zombies_to_spawn as usize + alive;
-            format!("ZOMBIES: {left}")
-        };
+    if wave.in_break {
+        // Throttle countdown formatting to ~10 Hz by quantising to tenths.
+        let tenths = (wave.break_timer.remaining_secs() * 10.0).max(0.0) as u32;
+        if cache.break_tenths != Some(tenths) {
+            cache.break_tenths = Some(tenths);
+            cache.zombies_left = None;
+            if let Ok(mut text) = wave_status.get_single_mut() {
+                text.sections[0].value =
+                    format!("{:.1}s", wave.break_timer.remaining_secs());
+            }
+        }
+    } else {
+        let alive = zombies.iter().count();
+        let left = wave.zombies_to_spawn as usize + alive;
+        if cache.zombies_left != Some(left) {
+            cache.zombies_left = Some(left);
+            cache.break_tenths = None;
+            if let Ok(mut text) = wave_status.get_single_mut() {
+                text.sections[0].value = format!("ZOMBIES: {left}");
+            }
+        }
     }
-    if let Ok(mut text) = score_text.get_single_mut() {
-        text.sections[0].value = format!("${}", score.0);
+    if cache.score != Some(score.0) {
+        cache.score = Some(score.0);
+        if let Ok(mut text) = score_text.get_single_mut() {
+            text.sections[0].value = format!("${}", score.0);
+        }
     }
 }
 

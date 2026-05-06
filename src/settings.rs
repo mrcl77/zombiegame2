@@ -289,18 +289,47 @@ fn apply_graphics_settings(
     };
 }
 
+/// Frame pacing without `thread::sleep` (which on macOS/Windows has 1-15 ms
+/// granularity and clashes with the swapchain).  Strategy:
+/// 1. If we're more than 2 ms early, do a short *coarse* sleep that
+///    intentionally undershoots the deadline (so we never overshoot).
+/// 2. Spin-yield the remaining sub-millisecond gap with `std::hint::spin_loop`
+///    + `thread::yield_now` for tight pacing without burning a core.
+///
+/// Result: stable cap at the requested FPS without the visible stutter that
+/// pure `thread::sleep(target - elapsed)` introduces under VSync coupling.
 fn fps_limiter(settings: Res<GraphicsSettings>, mut last: Local<Option<Instant>>) {
     let Some(cap) = FPS_CAPS[settings.fps_cap_idx] else {
         *last = None;
         return;
     };
     let target = Duration::from_secs_f64(1.0 / cap as f64);
+    let prev = match *last {
+        Some(p) => p,
+        None => {
+            *last = Some(Instant::now());
+            return;
+        }
+    };
+    let deadline = prev + target;
+
+    // Coarse sleep: aim to wake ~1.5 ms before deadline so we never overshoot.
+    const SLEEP_MARGIN: Duration = Duration::from_micros(1500);
     let now = Instant::now();
-    if let Some(prev) = *last {
-        let elapsed = now.saturating_duration_since(prev);
-        if elapsed < target {
-            std::thread::sleep(target - elapsed);
+    let safe_wake = deadline.checked_sub(SLEEP_MARGIN);
+    if let Some(wake_at) = safe_wake {
+        if let Some(sleep_for) = wake_at.checked_duration_since(now) {
+            if sleep_for > Duration::ZERO {
+                std::thread::sleep(sleep_for);
+            }
         }
     }
-    *last = Some(Instant::now());
+
+    // Fine spin-yield to the deadline.  yield_now hands the core back so we
+    // don't peg a CPU at 100 %; spin_loop is the SMT-friendly nop.
+    while Instant::now() < deadline {
+        std::hint::spin_loop();
+        std::thread::yield_now();
+    }
+    *last = Some(deadline);
 }

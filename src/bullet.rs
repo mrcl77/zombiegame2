@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use std::collections::{HashMap, VecDeque};
 
 use crate::audio::SfxEvent;
 use crate::map::{Explodable, ExplodableObstacleIdx, MapObstacles, ObstacleShape};
@@ -10,6 +11,41 @@ use crate::zombie::{
     DamageNumberEvent, Zombie, ZombieKilledEvent, ZombieKind, ZOMBIE_HIT_FLASH_DURATION,
 };
 use crate::{gameplay_active, GameState, Score};
+
+/// Number of past ticks of zombie position state we keep for lag
+/// compensation.  6 ticks at 60 Hz = 100 ms.  Picked because that's a
+/// reasonable upper bound on LAN RTT — any client lagging worse than
+/// that gets the latest position (less fair, but degrades gracefully).
+pub const REWIND_TICKS: usize = 6;
+
+/// Rolling history of zombie positions, indexed `[ticks_back][NetId] → pos`.
+/// `front` = newest tick, `back` = oldest.  Recorded by `record_zombie_history`
+/// after `zombie_movement` each `FixedUpdate` tick.  Used by
+/// `bullet_collision` to look up where a target was when a remote shooter
+/// pulled the trigger.
+#[derive(Resource, Default)]
+pub struct RewindBuffer {
+    frames: VecDeque<HashMap<u32, Vec2>>,
+}
+
+impl RewindBuffer {
+    /// Snapshot the current zombie poses; trim to `REWIND_TICKS + 1` frames.
+    pub fn record(&mut self, snapshot: HashMap<u32, Vec2>) {
+        self.frames.push_front(snapshot);
+        while self.frames.len() > REWIND_TICKS + 1 {
+            self.frames.pop_back();
+        }
+    }
+    /// Position from `ticks_back` ticks ago (saturating at the oldest entry).
+    /// `None` = the zombie didn't exist back then.
+    pub fn position(&self, net_id: u32, ticks_back: usize) -> Option<Vec2> {
+        let idx = ticks_back.min(self.frames.len().saturating_sub(1));
+        self.frames.get(idx)?.get(&net_id).copied()
+    }
+    pub fn clear(&mut self) {
+        self.frames.clear();
+    }
+}
 
 const BULLET_SPRITE_SIZE: Vec2 = Vec2::new(14.0, 6.0);
 const ROCKET_SPRITE_SIZE: Vec2 = Vec2::new(26.0, 12.0);
@@ -42,6 +78,11 @@ pub struct Bullet {
     pub is_flame: bool,
     /// Original lifetime, kept for the flame fade-out alpha curve.
     pub initial_lifetime: f32,
+    /// Player id of whoever fired the round.  Used by the host's
+    /// lag-compensated hit test: bullets from a non-local shooter are
+    /// rewound against the rolling zombie-position history so the shot lands
+    /// where the lagged client *saw* the target.
+    pub shooter_id: u8,
 }
 
 #[derive(Component)]
@@ -59,6 +100,9 @@ pub struct ShootEvent {
     pub is_rocket: bool,
     pub homing: bool,
     pub is_flame: bool,
+    /// Player id of the shooter.  Carried into the spawned `Bullet`
+    /// component so `bullet_collision` can lag-compensate.
+    pub shooter_id: u8,
 }
 
 #[derive(Event, Clone, Copy)]
@@ -192,6 +236,20 @@ pub struct BulletAssets {
     pub ember: Handle<Image>,
 }
 
+/// Pre-baked Mesh + ColorMaterial handles for thrown-projectile FX (smoke
+/// cloud + fire pool).  Without these, every grenade/molotov throw allocates
+/// a fresh `Circle` mesh and a fresh `ColorMaterial` — both leak into the
+/// asset GC roots until the cloud despawns, then have to be re-allocated for
+/// the next throw.  Building once at startup turns spawn into a cheap handle
+/// clone.
+#[derive(Resource)]
+pub struct ThrowableFxAssets {
+    pub smoke_mesh: bevy::sprite::Mesh2dHandle,
+    pub smoke_material: Handle<ColorMaterial>,
+    pub fire_mesh: bevy::sprite::Mesh2dHandle,
+    pub fire_material: Handle<ColorMaterial>,
+}
+
 pub struct BulletPlugin;
 
 impl Plugin for BulletPlugin {
@@ -199,8 +257,10 @@ impl Plugin for BulletPlugin {
         app.add_event::<ShootEvent>()
             .add_event::<ExplodeEvent>()
             .add_event::<ThrowEvent>()
+            .init_resource::<RewindBuffer>()
             .add_systems(Startup, setup_bullet_assets)
             .add_systems(OnExit(GameState::Playing), despawn_all_bullets)
+            .add_systems(OnExit(GameState::Playing), reset_rewind_buffer)
             .add_systems(
                 Update,
                 (
@@ -219,6 +279,7 @@ impl Plugin for BulletPlugin {
             .add_systems(
                 FixedUpdate,
                 (
+                    record_zombie_history,
                     shoot_listener,
                     throw_listener,
                     bullet_movement,
@@ -236,7 +297,12 @@ impl Plugin for BulletPlugin {
     }
 }
 
-fn setup_bullet_assets(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+fn setup_bullet_assets(
+    mut commands: Commands,
+    mut images: ResMut<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+) {
     let indicator_img = images.add(build_indicator_image());
     commands.insert_resource(BulletAssets {
         bullet: images.add(build_bullet_image()),
@@ -251,6 +317,14 @@ fn setup_bullet_assets(mut commands: Commands, mut images: ResMut<Assets<Image>>
         tracer: images.add(build_tracer_image()),
         shell: images.add(build_shell_image()),
         ember: images.add(build_ember_image()),
+    });
+    // Bake the smoke/fire mesh + material once and stash the handles —
+    // every throw later just clones the handles instead of allocating.
+    commands.insert_resource(ThrowableFxAssets {
+        smoke_mesh: bevy::sprite::Mesh2dHandle(meshes.add(Circle::new(SMOKE_RADIUS))),
+        smoke_material: materials.add(Color::srgba(0.7, 0.72, 0.75, 0.35)),
+        fire_mesh: bevy::sprite::Mesh2dHandle(meshes.add(Circle::new(FIRE_RADIUS))),
+        fire_material: materials.add(Color::srgba(0.9, 0.35, 0.05, 0.4)),
     });
     commands.spawn((
         SpriteBundle {
@@ -418,6 +492,7 @@ pub fn spawn_bullet_entity(
     homing: bool,
     target: Option<Entity>,
     is_flame: bool,
+    shooter_id: u8,
 ) -> Entity {
     let angle = direction.y.atan2(direction.x);
     let (texture, size, lifetime) = if is_flame {
@@ -465,6 +540,7 @@ pub fn spawn_bullet_entity(
                 target,
                 is_flame,
                 initial_lifetime: lifetime,
+                shooter_id,
             },
             NetId(net_id),
         ))
@@ -528,6 +604,7 @@ fn shoot_listener(
             ev.homing,
             target,
             ev.is_flame,
+            ev.shooter_id,
         );
         // Cheap glowing tracer streak from origin in the direction of fire.
         // Skipped for rockets and flames (they have their own bigger
@@ -752,12 +829,32 @@ fn spawn_impact_sparks(
     }
 }
 
+/// Snapshots the live zombie poses into `RewindBuffer`.  Runs at the top of
+/// the FixedUpdate chain so that `bullet_collision` later in the same tick
+/// can see "current" history.  Cheap: ~70 zombies × (u32 + Vec2) = small.
+fn record_zombie_history(
+    mut rewind: ResMut<RewindBuffer>,
+    zombies: Query<(&Transform, &NetId), With<Zombie>>,
+) {
+    let mut frame: HashMap<u32, Vec2> = HashMap::with_capacity(zombies.iter().count());
+    for (t, id) in &zombies {
+        frame.insert(id.0, t.translation.truncate());
+    }
+    rewind.record(frame);
+}
+
+fn reset_rewind_buffer(mut rewind: ResMut<RewindBuffer>) {
+    rewind.clear();
+}
+
 #[allow(clippy::too_many_arguments)]
 fn bullet_collision(
     mut commands: Commands,
     assets: Res<BulletAssets>,
+    rewind: Res<RewindBuffer>,
+    ctx: Res<NetContext>,
     bullets: Query<(Entity, &Transform, &Bullet)>,
-    mut zombies: Query<(Entity, &Transform, &mut Zombie)>,
+    mut zombies: Query<(Entity, &Transform, &mut Zombie, &NetId)>,
     mut explodables: Query<(Entity, &Transform, &mut Explodable, &ExplodableObstacleIdx)>,
     mut obstacles: ResMut<MapObstacles>,
     players: Query<&Player>,
@@ -768,17 +865,33 @@ fn bullet_collision(
     mut score: ResMut<Score>,
 ) {
     let mult = max_money_mult(&players);
+    let host_local_id = ctx.my_id;
     for (b_entity, b_transform, bullet) in &bullets {
         let bp = b_transform.translation.truncate();
         let mut consumed = false;
 
+        // Lag compensation: bullets fired by remote players hit-test against
+        // the rewound zombie position (~100 ms back), so the shot lands where
+        // the lagged client's screen showed the target.  Bullets from the
+        // host's local player or with no shooter id (single-player) skip the
+        // rewind — they already see real-time positions.
+        let rewind_for_this_bullet =
+            bullet.shooter_id != 0 && bullet.shooter_id != host_local_id;
+
         // Zombies first — they're the primary target.
-        for (z_entity, z_transform, mut zombie) in &mut zombies {
+        for (z_entity, z_transform, mut zombie, z_net) in &mut zombies {
             if zombie.hp <= 0 {
                 continue;
             }
-            let zp = z_transform.translation.truncate();
-            if bp.distance(zp) < BULLET_RADIUS + zombie.kind.radius() {
+            let zp = if rewind_for_this_bullet {
+                rewind
+                    .position(z_net.0, REWIND_TICKS)
+                    .unwrap_or_else(|| z_transform.translation.truncate())
+            } else {
+                z_transform.translation.truncate()
+            };
+            let r = BULLET_RADIUS + zombie.kind.radius();
+            if bp.distance_squared(zp) < r * r {
                 if bullet.is_rocket {
                     explode.send(ExplodeEvent {
                         pos: bp,
@@ -901,7 +1014,8 @@ fn explode_listener(
                 continue;
             }
             let zp = z_t.translation.truncate();
-            if zp.distance(ev.pos) < ev.radius + zombie.kind.radius() {
+            let r = ev.radius + zombie.kind.radius();
+            if zp.distance_squared(ev.pos) < r * r {
                 zombie.hp -= ev.zombie_damage;
                 zombie.hit_flash = ZOMBIE_HIT_FLASH_DURATION;
                 dmg_numbers.send(DamageNumberEvent {
@@ -938,7 +1052,8 @@ fn explode_listener(
                 continue;
             }
             let ep = e_t.translation.truncate();
-            if ep.distance(ev.pos) < ev.radius + 16.0 {
+            let r = ev.radius + 16.0;
+            if ep.distance_squared(ev.pos) < r * r {
                 expl.hp -= ev.zombie_damage.max(8);
                 if expl.hp <= 0 {
                     if let Some(o) = obstacles.list.get_mut(obs_idx.0) {
@@ -960,7 +1075,8 @@ fn explode_listener(
                 continue;
             }
             let pp = p_t.translation.truncate();
-            if pp.distance(ev.pos) < ev.radius + PLAYER_RADIUS {
+            let r = ev.radius + PLAYER_RADIUS;
+            if pp.distance_squared(ev.pos) < r * r {
                 damage_evw.send(PlayerDamagedEvent {
                     target_id: player.id,
                     amount: ev.player_damage,
@@ -1028,10 +1144,9 @@ fn thrown_projectile_update(
     mut commands: Commands,
     time: Res<Time>,
     obstacles: Res<MapObstacles>,
+    fx_assets: Res<ThrowableFxAssets>,
     mut q: Query<(Entity, &mut Transform, &mut ThrownProjectile)>,
     mut explode: EventWriter<ExplodeEvent>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
 ) {
     let dt = time.delta_seconds();
     for (entity, mut transform, mut proj) in &mut q {
@@ -1056,28 +1171,21 @@ fn thrown_projectile_update(
                 });
             }
             ThrowableKind::Smoke => {
-                spawn_smoke_cloud(&mut commands, &mut meshes, &mut materials, pos);
+                spawn_smoke_cloud(&mut commands, &fx_assets, pos);
             }
             ThrowableKind::Molotov => {
-                spawn_fire_pool(&mut commands, &mut meshes, &mut materials, pos);
+                spawn_fire_pool(&mut commands, &fx_assets, pos);
             }
         }
     }
 }
 
-fn spawn_smoke_cloud(
-    commands: &mut Commands,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<ColorMaterial>,
-    pos: Vec2,
-) {
-    use bevy::sprite::{MaterialMesh2dBundle, Mesh2dHandle};
-    let mesh = meshes.add(Circle::new(SMOKE_RADIUS));
-    let mat = materials.add(Color::srgba(0.7, 0.72, 0.75, 0.35));
+fn spawn_smoke_cloud(commands: &mut Commands, fx: &ThrowableFxAssets, pos: Vec2) {
+    use bevy::sprite::MaterialMesh2dBundle;
     commands.spawn((
         MaterialMesh2dBundle {
-            mesh: Mesh2dHandle(mesh),
-            material: mat,
+            mesh: fx.smoke_mesh.clone(),
+            material: fx.smoke_material.clone(),
             transform: Transform::from_xyz(pos.x, pos.y, 9.0),
             ..default()
         },
@@ -1088,19 +1196,12 @@ fn spawn_smoke_cloud(
     ));
 }
 
-fn spawn_fire_pool(
-    commands: &mut Commands,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<ColorMaterial>,
-    pos: Vec2,
-) {
-    use bevy::sprite::{MaterialMesh2dBundle, Mesh2dHandle};
-    let mesh = meshes.add(Circle::new(FIRE_RADIUS));
-    let mat = materials.add(Color::srgba(0.9, 0.35, 0.05, 0.4));
+fn spawn_fire_pool(commands: &mut Commands, fx: &ThrowableFxAssets, pos: Vec2) {
+    use bevy::sprite::MaterialMesh2dBundle;
     commands.spawn((
         MaterialMesh2dBundle {
-            mesh: Mesh2dHandle(mesh),
-            material: mat,
+            mesh: fx.fire_mesh.clone(),
+            material: fx.fire_material.clone(),
             transform: Transform::from_xyz(pos.x, pos.y, 9.0),
             ..default()
         },
@@ -1129,7 +1230,8 @@ fn smoke_cloud_update(
         let cp = cloud_t.translation.truncate();
         for (zt, mut zombie) in &mut zombies {
             let zp = zt.translation.truncate();
-            if zp.distance(cp) < cloud.radius + zombie.kind.radius() {
+            let r = cloud.radius + zombie.kind.radius();
+            if zp.distance_squared(cp) < r * r {
                 zombie.speed = zombie.kind.base_speed() * 0.3;
             }
         }
@@ -1164,7 +1266,8 @@ fn fire_pool_update(
                 continue;
             }
             let zp = zt.translation.truncate();
-            if zp.distance(fp) < fire.radius + zombie.kind.radius() {
+            let r = fire.radius + zombie.kind.radius();
+            if zp.distance_squared(fp) < r * r {
                 zombie.hp -= FIRE_DAMAGE;
                 zombie.hit_flash = ZOMBIE_HIT_FLASH_DURATION;
                 if zombie.hp <= 0 {

@@ -1,0 +1,426 @@
+use std::collections::VecDeque;
+
+use bevy::prelude::*;
+
+use crate::net::{
+    broadcast, sanitize_chat, ClientMsg, LocalNickname, NetContext, NetMode, ServerMsg,
+    CHAT_MAX_LEN,
+};
+use crate::{GameState, UiAssets};
+
+/// Time before a chat line stops rendering in the overlay.  The line stays
+/// in `ChatLog` until trimmed by `MAX_LINES`, but visually fades out.
+pub const CHAT_LINE_LIFETIME_SECS: f32 = 9.0;
+/// Hard cap on history depth — old lines drop off the bottom.
+const MAX_LINES: usize = 8;
+/// Y-offset and spacing for stacked chat lines in the overlay.
+const LINE_FONT_SIZE: f32 = 14.0;
+const LINE_GAP_PX: f32 = 2.0;
+
+#[derive(Clone, Debug)]
+pub struct ChatLine {
+    pub author: String,
+    pub text: String,
+    /// Seconds since received — drives the fade-out.
+    pub age_secs: f32,
+}
+
+#[derive(Resource, Default)]
+pub struct ChatLog {
+    pub lines: VecDeque<ChatLine>,
+}
+
+impl ChatLog {
+    pub fn push(&mut self, author: String, text: String) {
+        self.lines.push_back(ChatLine {
+            author,
+            text,
+            age_secs: 0.0,
+        });
+        while self.lines.len() > MAX_LINES {
+            self.lines.pop_front();
+        }
+    }
+}
+
+#[derive(Resource, Default)]
+pub struct ChatInputState {
+    pub open: bool,
+    pub buffer: String,
+}
+
+#[derive(Component)]
+pub struct ChatRoot;
+
+#[derive(Component)]
+pub struct ChatHistoryRoot;
+
+#[derive(Component)]
+pub struct ChatHistoryLine {
+    pub slot: usize,
+}
+
+#[derive(Component)]
+pub struct ChatInputBox;
+
+#[derive(Component)]
+pub struct ChatInputText;
+
+/// Bevy `SystemSet` for the chat input handler, exposed so other modules
+/// (notably `pause.rs`, which also listens for Escape) can order their own
+/// keyboard systems after chat to avoid same-frame races on the same key.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ChatInputSet;
+
+pub struct ChatPlugin;
+
+impl Plugin for ChatPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<ChatLog>()
+            .init_resource::<ChatInputState>()
+            .add_systems(OnEnter(GameState::Playing), spawn_chat_overlay)
+            .add_systems(OnExit(GameState::Playing), (despawn_chat_overlay, reset_chat_state))
+            .add_systems(
+                Update,
+                (
+                    chat_input_system.in_set(ChatInputSet),
+                    chat_age_lines,
+                    chat_render_overlay,
+                )
+                    .chain()
+                    .run_if(in_state(GameState::Playing)),
+            );
+    }
+}
+
+fn spawn_chat_overlay(mut commands: Commands, assets: Res<UiAssets>) {
+    let font = assets.font.clone();
+    commands
+        .spawn((
+            NodeBundle {
+                style: Style {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(20.0),
+                    bottom: Val::Px(180.0),
+                    width: Val::Px(640.0),
+                    flex_direction: FlexDirection::Column,
+                    justify_content: JustifyContent::FlexEnd,
+                    row_gap: Val::Px(LINE_GAP_PX),
+                    ..default()
+                },
+                z_index: ZIndex::Global(50),
+                ..default()
+            },
+            ChatRoot,
+        ))
+        .with_children(|parent| {
+            // History stack — pre-allocated lines, hidden when no message.
+            parent
+                .spawn((
+                    NodeBundle {
+                        style: Style {
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(LINE_GAP_PX),
+                            ..default()
+                        },
+                        ..default()
+                    },
+                    ChatHistoryRoot,
+                ))
+                .with_children(|stack| {
+                    for slot in 0..MAX_LINES {
+                        stack.spawn((
+                            TextBundle::from_section(
+                                "",
+                                TextStyle {
+                                    font: font.clone(),
+                                    font_size: LINE_FONT_SIZE,
+                                    color: Color::srgba(0.0, 0.0, 0.0, 0.0),
+                                },
+                            ),
+                            ChatHistoryLine { slot },
+                        ));
+                    }
+                });
+
+            // Input box — only visible while typing.
+            parent
+                .spawn((
+                    NodeBundle {
+                        style: Style {
+                            margin: UiRect::top(Val::Px(8.0)),
+                            padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                            ..default()
+                        },
+                        background_color: BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.65)),
+                        visibility: Visibility::Hidden,
+                        ..default()
+                    },
+                    ChatInputBox,
+                ))
+                .with_children(|row| {
+                    row.spawn((
+                        TextBundle::from_section(
+                            "",
+                            TextStyle {
+                                font,
+                                font_size: 16.0,
+                                color: Color::srgb(1.0, 0.95, 0.7),
+                            },
+                        ),
+                        ChatInputText,
+                    ));
+                });
+        });
+}
+
+fn despawn_chat_overlay(mut commands: Commands, q: Query<Entity, With<ChatRoot>>) {
+    for e in &q {
+        commands.entity(e).despawn_recursive();
+    }
+}
+
+fn reset_chat_state(mut state: ResMut<ChatInputState>, mut log: ResMut<ChatLog>) {
+    state.open = false;
+    state.buffer.clear();
+    log.lines.clear();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chat_input_system(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut state: ResMut<ChatInputState>,
+    mut log: ResMut<ChatLog>,
+    ctx: Res<NetContext>,
+    net: Res<NetMode>,
+    local_nick: Res<LocalNickname>,
+) {
+    // Open/close hotkey: T toggles open, Escape closes.  When closed, the T
+    // key starts an empty buffer; when open, every other key flows into the
+    // buffer (Enter to send, Backspace to delete).
+    if !state.open {
+        if keys.just_pressed(KeyCode::KeyT) {
+            state.open = true;
+            state.buffer.clear();
+        }
+        return;
+    }
+
+    if keys.just_pressed(KeyCode::Escape) {
+        state.open = false;
+        state.buffer.clear();
+        return;
+    }
+
+    if keys.just_pressed(KeyCode::Enter) {
+        let buf = std::mem::take(&mut state.buffer);
+        state.open = false;
+        if let Some(clean) = sanitize_chat(&buf) {
+            send_local_chat(&clean, &ctx, &net, &local_nick, &mut log);
+        }
+        return;
+    }
+
+    if keys.just_pressed(KeyCode::Backspace) {
+        state.buffer.pop();
+        return;
+    }
+
+    for key in keys.get_just_pressed() {
+        // Letter keys produce uppercase — matches the nickname renderer.
+        if let Some(c) = keycode_to_letter(*key) {
+            push_char(&mut state.buffer, c);
+        } else if let Some(d) = keycode_to_digit(*key) {
+            push_char(&mut state.buffer, d);
+        } else if matches!(key, KeyCode::Space) {
+            push_char(&mut state.buffer, ' ');
+        } else if matches!(key, KeyCode::Period | KeyCode::NumpadDecimal) {
+            push_char(&mut state.buffer, '.');
+        } else if matches!(key, KeyCode::Comma) {
+            push_char(&mut state.buffer, ',');
+        } else if matches!(key, KeyCode::Slash) {
+            push_char(&mut state.buffer, '?');
+        } else if matches!(key, KeyCode::Minus | KeyCode::NumpadSubtract) {
+            push_char(&mut state.buffer, '-');
+        } else if matches!(key, KeyCode::Equal | KeyCode::NumpadAdd) {
+            push_char(&mut state.buffer, '+');
+        } else if matches!(key, KeyCode::Quote) {
+            push_char(&mut state.buffer, '\'');
+        } else if matches!(key, KeyCode::Semicolon) {
+            push_char(&mut state.buffer, ':');
+        }
+    }
+}
+
+fn push_char(buf: &mut String, c: char) {
+    if buf.chars().count() < CHAT_MAX_LEN {
+        buf.push(c);
+    }
+}
+
+/// Resolve our own author name for outgoing chat.  Host uses `LocalNickname`;
+/// clients use the same (server displays the nickname they Hello'd with).
+fn local_author(local_nick: &LocalNickname) -> String {
+    if local_nick.0.trim().is_empty() {
+        "GRACZ".to_string()
+    } else {
+        local_nick.0.clone()
+    }
+}
+
+fn send_local_chat(
+    text: &str,
+    ctx: &NetContext,
+    net: &NetMode,
+    local_nick: &LocalNickname,
+    log: &mut ChatLog,
+) {
+    match *net {
+        NetMode::SinglePlayer => {
+            log.push(local_author(local_nick), text.to_string());
+        }
+        NetMode::Host => {
+            let author = local_author(local_nick);
+            log.push(author.clone(), text.to_string());
+            if let Some(host) = ctx.host.as_ref() {
+                broadcast(
+                    host,
+                    &ServerMsg::Chat {
+                        author,
+                        text: text.to_string(),
+                    },
+                );
+            }
+        }
+        NetMode::Client => {
+            // Clients send to host and let the broadcast echo back so the
+            // line appears in our own log too.  Avoids divergence if the
+            // server rejects/edits it.
+            if let Some(client) = ctx.client.as_ref() {
+                let _ = client.sender.send(ClientMsg::Chat {
+                    text: text.to_string(),
+                });
+            }
+        }
+    }
+}
+
+fn chat_age_lines(time: Res<Time>, mut log: ResMut<ChatLog>) {
+    let dt = time.delta_seconds();
+    for line in log.lines.iter_mut() {
+        line.age_secs += dt;
+    }
+}
+
+fn chat_render_overlay(
+    state: Res<ChatInputState>,
+    log: Res<ChatLog>,
+    mut history: Query<(&ChatHistoryLine, &mut Text)>,
+    mut input_box: Query<&mut Visibility, With<ChatInputBox>>,
+    mut input_text: Query<&mut Text, (With<ChatInputText>, Without<ChatHistoryLine>)>,
+) {
+    // Render history bottom-up so newest sits closest to the input box.
+    let visible: Vec<&ChatLine> = log
+        .lines
+        .iter()
+        .rev()
+        .take(MAX_LINES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let count = visible.len();
+
+    for (line_marker, mut text) in history.iter_mut() {
+        // Slot 0 is the bottom-most rendered line; slot N-1 is at the top.
+        // We want newest at the bottom, so map slot i → visible[count-1-i].
+        let idx_from_top = MAX_LINES - 1 - line_marker.slot;
+        if idx_from_top >= count {
+            text.sections[0].value.clear();
+            text.sections[0].style.color = Color::srgba(0.0, 0.0, 0.0, 0.0);
+            continue;
+        }
+        let line = visible[count - 1 - idx_from_top];
+        // Stay open while typing so the player has full context; otherwise
+        // fade out after the lifetime threshold.
+        let alpha = if state.open {
+            1.0
+        } else {
+            let remaining = (CHAT_LINE_LIFETIME_SECS - line.age_secs)
+                .clamp(0.0, CHAT_LINE_LIFETIME_SECS);
+            // Linear fade over the last 1.5 s of life.
+            (remaining / 1.5).clamp(0.0, 1.0)
+        };
+        if alpha <= 0.005 {
+            text.sections[0].value.clear();
+            text.sections[0].style.color = Color::srgba(0.0, 0.0, 0.0, 0.0);
+            continue;
+        }
+        text.sections[0].value = format!("{}: {}", line.author, line.text);
+        text.sections[0].style.color = Color::srgba(1.0, 0.95, 0.85, alpha);
+    }
+
+    // Input box — visible only while typing.
+    if let Ok(mut vis) = input_box.get_single_mut() {
+        *vis = if state.open {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+    }
+    if let Ok(mut text) = input_text.get_single_mut() {
+        if state.open {
+            text.sections[0].value = format!("> {}_", state.buffer);
+        } else {
+            text.sections[0].value.clear();
+        }
+    }
+}
+
+fn keycode_to_digit(k: KeyCode) -> Option<char> {
+    match k {
+        KeyCode::Digit0 | KeyCode::Numpad0 => Some('0'),
+        KeyCode::Digit1 | KeyCode::Numpad1 => Some('1'),
+        KeyCode::Digit2 | KeyCode::Numpad2 => Some('2'),
+        KeyCode::Digit3 | KeyCode::Numpad3 => Some('3'),
+        KeyCode::Digit4 | KeyCode::Numpad4 => Some('4'),
+        KeyCode::Digit5 | KeyCode::Numpad5 => Some('5'),
+        KeyCode::Digit6 | KeyCode::Numpad6 => Some('6'),
+        KeyCode::Digit7 | KeyCode::Numpad7 => Some('7'),
+        KeyCode::Digit8 | KeyCode::Numpad8 => Some('8'),
+        KeyCode::Digit9 | KeyCode::Numpad9 => Some('9'),
+        _ => None,
+    }
+}
+
+fn keycode_to_letter(k: KeyCode) -> Option<char> {
+    match k {
+        KeyCode::KeyA => Some('A'),
+        KeyCode::KeyB => Some('B'),
+        KeyCode::KeyC => Some('C'),
+        KeyCode::KeyD => Some('D'),
+        KeyCode::KeyE => Some('E'),
+        KeyCode::KeyF => Some('F'),
+        KeyCode::KeyG => Some('G'),
+        KeyCode::KeyH => Some('H'),
+        KeyCode::KeyI => Some('I'),
+        KeyCode::KeyJ => Some('J'),
+        KeyCode::KeyK => Some('K'),
+        KeyCode::KeyL => Some('L'),
+        KeyCode::KeyM => Some('M'),
+        KeyCode::KeyN => Some('N'),
+        KeyCode::KeyO => Some('O'),
+        KeyCode::KeyP => Some('P'),
+        KeyCode::KeyQ => Some('Q'),
+        KeyCode::KeyR => Some('R'),
+        KeyCode::KeyS => Some('S'),
+        KeyCode::KeyT => Some('T'),
+        KeyCode::KeyU => Some('U'),
+        KeyCode::KeyV => Some('V'),
+        KeyCode::KeyW => Some('W'),
+        KeyCode::KeyX => Some('X'),
+        KeyCode::KeyY => Some('Y'),
+        KeyCode::KeyZ => Some('Z'),
+        _ => None,
+    }
+}

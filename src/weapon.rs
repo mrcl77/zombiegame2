@@ -596,11 +596,12 @@ fn refresh_pickup_prompt(
     }
     let pp = p_t.translation.truncate();
     let mut nearest: Option<Weapon> = None;
-    let mut best_d = PLAYER_RADIUS + PICKUP_PICK_RADIUS;
+    let r = PLAYER_RADIUS + PICKUP_PICK_RADIUS;
+    let mut best_d2 = r * r;
     for (pk_t, pickup) in pickups.iter() {
-        let d = pp.distance(pk_t.translation.truncate());
-        if d < best_d && p.slots[1] != Some(pickup.kind) {
-            best_d = d;
+        let d2 = pp.distance_squared(pk_t.translation.truncate());
+        if d2 < best_d2 && p.slots[1] != Some(pickup.kind) {
+            best_d2 = d2;
             nearest = Some(pickup.kind);
         }
     }
@@ -886,8 +887,9 @@ fn pickup_collection(
             remote.0.get(&player.id).map(|i| i.interact).unwrap_or(false)
         };
         for (entity, pk_t, pickup, net_id) in &pickups {
-            let d = pp.distance(pk_t.translation.truncate());
-            if d < PLAYER_RADIUS + PICKUP_PICK_RADIUS {
+            let r = PLAYER_RADIUS + PICKUP_PICK_RADIUS;
+            let d2 = pp.distance_squared(pk_t.translation.truncate());
+            if d2 < r * r {
                 // Already holding this exact weapon — skip silently so we
                 // don't keep "picking it up".
                 if player.slots[1] == Some(pickup.kind) {
@@ -962,8 +964,9 @@ fn health_collection(
         }
         let pp = p_t.translation.truncate();
         for (entity, pk_t, net_id) in &pickups {
-            let d = pp.distance(pk_t.translation.truncate());
-            if d < PLAYER_RADIUS + PICKUP_PICK_RADIUS {
+            let r = PLAYER_RADIUS + PICKUP_PICK_RADIUS;
+            let d2 = pp.distance_squared(pk_t.translation.truncate());
+            if d2 < r * r {
                 player.hp = (player.hp + HEAL_AMOUNT).min(PLAYER_MAX_HP);
                 net_entities.pickups.remove(&net_id.0);
                 commands.entity(entity).despawn_recursive();
@@ -1049,8 +1052,9 @@ fn throwable_collection(
         }
         let pp = p_t.translation.truncate();
         for (entity, pk_t, pickup, net_id) in &pickups {
-            let d = pp.distance(pk_t.translation.truncate());
-            if d < PLAYER_RADIUS + PICKUP_PICK_RADIUS {
+            let r = PLAYER_RADIUS + PICKUP_PICK_RADIUS;
+            let d2 = pp.distance_squared(pk_t.translation.truncate());
+            if d2 < r * r {
                 if player.throwable_kind == pickup.kind {
                     player.throwable_count += pickup.count;
                 } else {
@@ -1136,8 +1140,9 @@ fn armor_collection(
         }
         let pp = p_t.translation.truncate();
         for (entity, pk_t, net_id) in &pickups {
-            let d = pp.distance(pk_t.translation.truncate());
-            if d < PLAYER_RADIUS + PICKUP_PICK_RADIUS {
+            let r = PLAYER_RADIUS + PICKUP_PICK_RADIUS;
+            let d2 = pp.distance_squared(pk_t.translation.truncate());
+            if d2 < r * r {
                 // Armor pickups refill the pool to full — picking one up
                 // effectively doubles your HP, so the bar should snap to
                 // max rather than incrementing in tiny steps.
@@ -1223,8 +1228,9 @@ fn money_collection(
         }
         let pp = p_t.translation.truncate();
         for (entity, pk_t, pickup, net_id) in &pickups {
-            let d = pp.distance(pk_t.translation.truncate());
-            if d < PLAYER_RADIUS + PICKUP_PICK_RADIUS {
+            let r = PLAYER_RADIUS + PICKUP_PICK_RADIUS;
+            let d2 = pp.distance_squared(pk_t.translation.truncate());
+            if d2 < r * r {
                 player.money_mult = pickup.factor.max(player.money_mult);
                 player.money_mult_timer = MONEY_MULT_DURATION;
                 net_entities.pickups.remove(&net_id.0);

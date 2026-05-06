@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 
-use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
 
 use bevy::prelude::*;
@@ -116,111 +115,13 @@ pub fn spawn_point_world(spec: &SpawnPointSpec) -> Vec2 {
 //  Obstacles + nav
 // ════════════════════════════════════════════════════════════════════════
 
-#[derive(Clone, Copy)]
-pub enum ObstacleShape {
-    Circle(f32),
-    Rect(Vec2),
-}
+// Obstacles + spatial grid live in `map_obstacles` (split out 2026-05-03
+// to keep this file from sprawling further).  Re-exported below so existing
+// `use crate::map::{MapObstacles, Obstacle, ObstacleShape, ...}` imports
+// keep working without churn.
+pub use crate::map_obstacles::{MapObstacles, Obstacle, ObstacleShape};
 
-#[derive(Clone, Copy)]
-pub struct Obstacle {
-    pub pos: Vec2,
-    pub shape: ObstacleShape,
-}
-
-#[derive(Resource, Default)]
-pub struct MapObstacles {
-    pub list: Vec<Obstacle>,
-}
-
-impl MapObstacles {
-    pub fn resolve(&self, pos: &mut Vec2, own_radius: f32) {
-        for o in &self.list {
-            match o.shape {
-                ObstacleShape::Circle(r) => {
-                    let delta = *pos - o.pos;
-                    let min_dist = r + own_radius;
-                    let dist_sq = delta.length_squared();
-                    if dist_sq < min_dist * min_dist {
-                        if dist_sq > 0.0001 {
-                            let dist = dist_sq.sqrt();
-                            *pos += delta / dist * (min_dist - dist);
-                        } else {
-                            *pos += Vec2::new(min_dist, 0.0);
-                        }
-                    }
-                }
-                ObstacleShape::Rect(half) => {
-                    let delta = *pos - o.pos;
-                    let clamped = Vec2::new(
-                        delta.x.clamp(-half.x, half.x),
-                        delta.y.clamp(-half.y, half.y),
-                    );
-                    let closest = o.pos + clamped;
-                    let diff = *pos - closest;
-                    let dist_sq = diff.length_squared();
-                    if dist_sq < own_radius * own_radius {
-                        if dist_sq > 0.0001 {
-                            let dist = dist_sq.sqrt();
-                            *pos = closest + diff / dist * own_radius;
-                        } else {
-                            let dx_left = delta.x + half.x;
-                            let dx_right = half.x - delta.x;
-                            let dy_bot = delta.y + half.y;
-                            let dy_top = half.y - delta.y;
-                            let min_x = dx_left.min(dx_right);
-                            let min_y = dy_bot.min(dy_top);
-                            if min_x < min_y {
-                                if dx_left < dx_right {
-                                    pos.x = o.pos.x - half.x - own_radius;
-                                } else {
-                                    pos.x = o.pos.x + half.x + own_radius;
-                                }
-                            } else if dy_bot < dy_top {
-                                pos.y = o.pos.y - half.y - own_radius;
-                            } else {
-                                pos.y = o.pos.y + half.y + own_radius;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn remove_at(&mut self, pos: Vec2) {
-        self.list.retain(|o| o.pos.distance_squared(pos) > 4.0);
-    }
-
-    /// Cheap intersection test: true if a circle of `radius` centred at `pos`
-    /// overlaps any obstacle in the list.  Used by bullets, zombies and
-    /// throwables.
-    pub fn hits(&self, pos: Vec2, radius: f32) -> bool {
-        for o in &self.list {
-            match o.shape {
-                ObstacleShape::Circle(r) => {
-                    let min_d = r + radius;
-                    if pos.distance_squared(o.pos) < min_d * min_d {
-                        return true;
-                    }
-                }
-                ObstacleShape::Rect(half) => {
-                    let delta = pos - o.pos;
-                    let clamped = Vec2::new(
-                        delta.x.clamp(-half.x, half.x),
-                        delta.y.clamp(-half.y, half.y),
-                    );
-                    let closest = o.pos + clamped;
-                    if pos.distance_squared(closest) < radius * radius {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
-    }
-}
-
+#[inline]
 pub fn tile_center(col: i32, row: i32) -> Vec2 {
     Vec2::new(
         -MAP_WIDTH * 0.5 + (col as f32 + 0.5) * TILE_SIZE,
@@ -228,56 +129,32 @@ pub fn tile_center(col: i32, row: i32) -> Vec2 {
     )
 }
 
+#[inline]
 pub fn world_to_tile(pos: Vec2) -> (i32, i32) {
     let col = ((pos.x + MAP_WIDTH * 0.5) / TILE_SIZE).floor() as i32;
     let row = ((pos.y + MAP_HEIGHT * 0.5) / TILE_SIZE).floor() as i32;
     (col, row)
 }
 
+#[inline]
 pub fn in_bounds(col: i32, row: i32) -> bool {
     (0..MAP_COLS).contains(&col) && (0..MAP_ROWS).contains(&row)
 }
 
+#[inline]
 pub fn nav_idx(col: i32, row: i32) -> usize {
     (row * MAP_COLS + col) as usize
 }
 
-#[derive(Resource)]
-pub struct NavGrid {
-    pub walkable: Vec<bool>,
-    pub player_flow: HashMap<u8, Vec<u16>>,
-    pub player_flow_tile: HashMap<u8, (i32, i32)>,
-}
+// NavGrid + BFS distance fields live in `map_nav` (split out 2026-05-03).
+// Re-exported here so existing `use crate::map::{NavGrid, bfs_distance_field, ...}`
+// keeps working.
+pub use crate::map_nav::{bfs_distance_field, NavGrid};
 
-impl Default for NavGrid {
-    fn default() -> Self {
-        let total = (MAP_COLS * MAP_ROWS) as usize;
-        let mut walkable = vec![false; total];
-        for row in 0..MAP_ROWS {
-            for col in 0..MAP_COLS {
-                walkable[(row * MAP_COLS + col) as usize] = is_walkable_tile(col, row);
-            }
-        }
-        Self {
-            walkable,
-            player_flow: HashMap::new(),
-            player_flow_tile: HashMap::new(),
-        }
-    }
-}
-
-pub fn unlock_nav_rows(nav: &mut NavGrid, row_min: i32, row_max: i32) {
-    let rmin = row_min.max(0);
-    let rmax = row_max.min(MAP_ROWS - 1);
-    for row in rmin..=rmax {
-        for col in 0..MAP_COLS {
-            nav.walkable[(row * MAP_COLS + col) as usize] = is_walkable_tile(col, row);
-        }
-    }
-    nav.player_flow.clear();
-    nav.player_flow_tile.clear();
-}
-
+/// Tile is walkable when it doesn't overlap any wall rect.  This is the
+/// build-time predicate used by `NavGrid::default()` and `unlock_nav_rows`.
+/// Lives here (not in `map_nav`) because it touches `wall_rects()`, which
+/// is map-build state belonging in this file.
 pub fn is_walkable_tile(col: i32, row: i32) -> bool {
     if !in_bounds(col, row) {
         return false;
@@ -291,66 +168,6 @@ pub fn is_walkable_tile(col: i32, row: i32) -> bool {
         }
     }
     true
-}
-
-pub fn bfs_distance_field(walkable: &[bool], start: Vec2) -> Vec<u16> {
-    let total = (MAP_COLS * MAP_ROWS) as usize;
-    let mut dist = vec![u16::MAX; total];
-    let (sc, sr) = world_to_tile(start);
-    let (sc, sr) = snap_to_walkable(walkable, sc, sr);
-    if !in_bounds(sc, sr) || !walkable[nav_idx(sc, sr)] {
-        return dist;
-    }
-    dist[nav_idx(sc, sr)] = 0;
-    let mut queue: VecDeque<(i32, i32)> = VecDeque::with_capacity(total);
-    queue.push_back((sc, sr));
-    let dirs: [(i32, i32); 8] = [
-        (-1, 0), (1, 0), (0, -1), (0, 1),
-        (-1, -1), (-1, 1), (1, -1), (1, 1),
-    ];
-    while let Some((c, r)) = queue.pop_front() {
-        let d = dist[nav_idx(c, r)];
-        for &(dc, dr) in &dirs {
-            let (nc, nr) = (c + dc, r + dr);
-            if !in_bounds(nc, nr) {
-                continue;
-            }
-            let ni = nav_idx(nc, nr);
-            if !walkable[ni] {
-                continue;
-            }
-            if dc != 0 && dr != 0
-                && (!walkable[nav_idx(c + dc, r)] || !walkable[nav_idx(c, r + dr)])
-            {
-                continue;
-            }
-            if dist[ni] > d + 1 {
-                dist[ni] = d + 1;
-                queue.push_back((nc, nr));
-            }
-        }
-    }
-    dist
-}
-
-fn snap_to_walkable(walkable: &[bool], col: i32, row: i32) -> (i32, i32) {
-    if in_bounds(col, row) && walkable[nav_idx(col, row)] {
-        return (col, row);
-    }
-    for ring in 1_i32..=8 {
-        for dr in -ring..=ring {
-            for dc in -ring..=ring {
-                if dc.abs() != ring && dr.abs() != ring {
-                    continue;
-                }
-                let (c, r) = (col + dc, row + dr);
-                if in_bounds(c, r) && walkable[nav_idx(c, r)] {
-                    return (c, r);
-                }
-            }
-        }
-    }
-    (col, row)
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1043,6 +860,34 @@ pub enum FurnKind {
     Barrels,
     Gurney,
     Bench,
+    // ── Kitchen ────────────────────────────────────────────────────────
+    Fridge,
+    Stove,
+    KitchenSink,
+    // ── Bathroom ───────────────────────────────────────────────────────
+    Toilet,
+    Bathtub,
+    BathSink,
+    // ── Bedroom ────────────────────────────────────────────────────────
+    Dresser,
+    Wardrobe,
+    Nightstand,
+    // ── Living / dining ────────────────────────────────────────────────
+    CoffeeTable,
+    Bookshelf,
+    DiningTable,
+    DiningChair,
+    ArmChair,
+    Fireplace,
+    // ── Decoration (no collision) ──────────────────────────────────────
+    FloorLamp,
+    Rug,
+    Plant,
+    Painting,
+    // ── Misc ───────────────────────────────────────────────────────────
+    Trashcan,
+    FilingCabinet,
+    OfficeChair,
 }
 
 /// Per-archetype furniture layout per floor.  `floor=0` is ground (default
@@ -1059,55 +904,61 @@ pub fn furniture_for_floor(
     match (kind, floor) {
         // ── Apartment block: lobby → residential (4 mieszkania) → roof ──
         (B::Apartment, 0) => &[
-            // Ground floor lobby — entry hall with mailbox counter and a
-            // sitting area for waiting tenants.  Open layout so players
-            // funnel through to the staircase.
-            (F::Counter, 0.0, 30.0),
-            (F::Couch, -45.0, -25.0),
-            (F::Couch, 45.0, -25.0),
-            (F::Tv, 0.0, -30.0),
+            // Lobby — mailbox counter + sitting area, sparse on purpose.
+            (F::Counter, 0.0, 70.0),
+            (F::Couch, -55.0, -10.0),
+            (F::Couch, 55.0, -10.0),
+            (F::Tv, 0.0, -55.0),
+            (F::Plant, -90.0, 80.0),
         ],
         (B::Apartment, 1) => &[
-            // 1. piętro — four "wielka płyta" mieszkania around a central
-            // corridor crossing.  Each quadrant has a bed plus either a
-            // couch+TV (living room style) or a kitchen counter.
-            // NW apt — sypialnia + salon (couch faces TV).
-            (F::Bed, -55.0, 50.0),
-            (F::Couch, -50.0, 18.0),
-            // NE apt — sypialnia + kuchnia (counter against shared wall).
-            (F::Bed, 55.0, 50.0),
-            (F::Counter, 50.0, 18.0),
-            // SW apt — pokój dzienny + TV.
-            (F::Couch, -50.0, -45.0),
-            (F::Tv, -50.0, -18.0),
-            // SE apt — sypialnia + couch.
-            (F::Bed, 55.0, -50.0),
-            (F::Couch, 50.0, -18.0),
+            // 1. piętro — four mieszkania, only the essentials per quadrant.
+            // NW: sypialnia
+            (F::Bed, -60.0, 75.0),
+            (F::Nightstand, -32.0, 75.0),
+            (F::Dresser, -85.0, 38.0),
+            // NE: kuchnia
+            (F::Fridge, 92.0, 88.0),
+            (F::Stove, 60.0, 92.0),
+            (F::DiningTable, 65.0, 45.0),
+            // SW: salon
+            (F::Couch, -60.0, -45.0),
+            (F::Tv, -90.0, -75.0),
+            (F::Bookshelf, -85.0, -45.0),
+            // SE: łazienka
+            (F::Bathtub, 70.0, -90.0),
+            (F::Toilet, 38.0, -45.0),
+            (F::Wardrobe, 95.0, -50.0),
         ],
         (B::Apartment, 2) => &[
-            // 2. piętro — slightly different layout so floors don't all look
-            // identical.  More beds, fewer couches, kitchen counters in
-            // both north quadrants.
-            (F::Bed, -55.0, 50.0),
-            (F::Counter, -50.0, 18.0),
-            (F::Bed, 55.0, 50.0),
-            (F::Tv, 50.0, 18.0),
-            (F::Bed, -55.0, -50.0),
-            (F::Couch, -50.0, -18.0),
-            (F::Bed, 55.0, -45.0),
-            (F::Couch, 50.0, -18.0),
+            // 2. piętro — mirrored layout vs floor 1.
+            // NW: kuchnia
+            (F::Fridge, -92.0, 88.0),
+            (F::Stove, -60.0, 92.0),
+            (F::DiningTable, -65.0, 45.0),
+            // NE: sypialnia
+            (F::Bed, 60.0, 75.0),
+            (F::Nightstand, 32.0, 75.0),
+            (F::Dresser, 85.0, 38.0),
+            // SW: łazienka
+            (F::Bathtub, -70.0, -90.0),
+            (F::Toilet, -38.0, -45.0),
+            (F::Wardrobe, -95.0, -50.0),
+            // SE: salon
+            (F::Couch, 60.0, -45.0),
+            (F::Tv, 90.0, -75.0),
+            (F::Bookshelf, 85.0, -45.0),
         ],
         (B::Apartment, 3) => &[
-            // 3. piętro — penthouse-ish: more couches, less furniture per
-            // unit so it reads as a higher-end floor.
-            (F::Couch, -50.0, 45.0),
-            (F::Tv, -50.0, 18.0),
-            (F::Bed, 55.0, 50.0),
-            (F::Couch, 50.0, 18.0),
-            (F::Bed, -55.0, -50.0),
-            (F::Counter, -50.0, -18.0),
-            (F::Couch, 50.0, -45.0),
-            (F::Tv, 50.0, -18.0),
+            // 3. piętro — penthouse: fireplace lounge above, bedroom + dining below.
+            (F::Fireplace, 0.0, 95.0),
+            (F::Couch, -50.0, 50.0),
+            (F::ArmChair, 50.0, 50.0),
+            (F::Bookshelf, -90.0, 70.0),
+            (F::Bed, -55.0, -55.0),
+            (F::Wardrobe, -95.0, -85.0),
+            (F::DiningTable, 55.0, -55.0),
+            (F::DiningChair, 80.0, -55.0),
         ],
         // ── Hospital: ER reception → patient rooms (4 sale) → helipad ───
         (B::Hospital, 0) => &[
@@ -1139,63 +990,102 @@ pub fn furniture_for_floor(
 
         // ── Single-floor archetypes — only floor 0 has content ──────────
         (B::House, 0) => &[
-            (F::Bed, -50.0, 30.0),
-            (F::Couch, 40.0, -20.0),
-            (F::Tv, 60.0, 30.0),
+            // Open-plan suburban house: bedroom NW, bathroom NE, salon SW,
+            // kitchen+dining SE.  Just the essentials so the room reads
+            // without feeling crammed.
+            (F::Bed, -55.0, 50.0),
+            (F::Wardrobe, -85.0, 50.0),
+            (F::Toilet, 75.0, 65.0),
+            (F::Bathtub, 60.0, 40.0),
+            (F::Couch, -55.0, -35.0),
+            (F::Tv, -85.0, -60.0),
+            (F::Bookshelf, -78.0, -10.0),
+            (F::Fridge, 80.0, -50.0),
+            (F::Stove, 50.0, -55.0),
+            (F::DiningTable, 55.0, -10.0),
+            (F::DiningChair, 80.0, -10.0),
         ],
-        (B::Shed, 0) => &[(F::Crate, 0.0, 0.0)],
+        (B::Shed, 0) => &[
+            (F::Crate, -20.0, -10.0),
+            (F::Barrels, 20.0, 10.0),
+        ],
         (B::Garage, 0) => &[
-            (F::Crate, -30.0, 0.0),
-            (F::Barrels, 30.0, 0.0),
+            (F::Crate, -35.0, -20.0),
+            (F::Barrels, 35.0, -20.0),
+            (F::Shelf, 0.0, 30.0),
         ],
         (B::Shop, 0) | (B::Market, 0) => &[
             (F::Counter, 0.0, -25.0),
             (F::Shelf, -50.0, 30.0),
             (F::Shelf, 50.0, 30.0),
+            (F::Crate, 0.0, 30.0),
         ],
         (B::Civic, 0) => &[
-            (F::Desk, -40.0, 0.0),
-            (F::Desk, 40.0, 0.0),
+            (F::Desk, -45.0, 25.0),
+            (F::Desk, 45.0, 25.0),
+            (F::FilingCabinet, -55.0, -35.0),
+            (F::FilingCabinet, 55.0, -35.0),
+            (F::Bench, 0.0, -55.0),
         ],
         (B::Church, 0) => &[
-            (F::Altar, 0.0, 30.0),
+            (F::Altar, 0.0, 60.0),
+            (F::Bench, 0.0, 10.0),
             (F::Bench, 0.0, -30.0),
+            (F::Bench, 0.0, -65.0),
         ],
         (B::Bank, 0) => &[
             (F::Counter, 0.0, -25.0),
-            (F::Desk, 0.0, 35.0),
+            (F::Desk, -45.0, 35.0),
+            (F::Desk, 45.0, 35.0),
+            (F::FilingCabinet, -80.0, 0.0),
         ],
-        (B::Tower, 0) => &[(F::Desk, 0.0, 0.0)],
+        (B::Tower, 0) => &[
+            (F::Desk, -25.0, 0.0),
+            (F::FilingCabinet, 30.0, 0.0),
+        ],
         (B::Factory, 0) => &[
             (F::Crate, -60.0, -30.0),
-            (F::Crate, -60.0, 30.0),
-            (F::Barrels, 60.0, 0.0),
+            (F::Crate, 30.0, 0.0),
+            (F::Barrels, 60.0, 30.0),
+            (F::Barrels, -60.0, 30.0),
         ],
         (B::Warehouse, 0) => &[
-            (F::Crate, -50.0, -30.0),
-            (F::Crate, 50.0, -30.0),
-            (F::Crate, 0.0, 30.0),
-            (F::Barrels, -50.0, 30.0),
+            (F::Crate, -60.0, -50.0),
+            (F::Crate, 60.0, -50.0),
+            (F::Crate, 0.0, 50.0),
+            (F::Barrels, -50.0, 50.0),
+            (F::Barrels, 50.0, 50.0),
         ],
         (B::Depot, 0) => &[
-            (F::Crate, -40.0, 0.0),
-            (F::Crate, 40.0, 0.0),
+            (F::Crate, -50.0, -25.0),
+            (F::Barrels, 50.0, -25.0),
+            (F::Shelf, 0.0, 35.0),
         ],
         (B::Morgue, 0) => &[
-            (F::Gurney, -40.0, 0.0),
-            (F::Gurney, 40.0, 0.0),
+            (F::Gurney, -45.0, -30.0),
+            (F::Gurney, 45.0, -30.0),
+            (F::FilingCabinet, -65.0, 50.0),
+            (F::FilingCabinet, 65.0, 50.0),
         ],
-        (B::Park, 0) => &[(F::Bench, 0.0, 0.0)],
+        (B::Park, 0) => &[
+            (F::Bench, -45.0, 0.0),
+            (F::Bench, 45.0, 0.0),
+        ],
         (B::Bunker, 0) => &[
-            (F::Cot, -40.0, -30.0),
-            (F::Cot, -40.0, 30.0),
-            (F::Crate, 40.0, 0.0),
+            (F::Cot, -50.0, -30.0),
+            (F::Cot, 50.0, -30.0),
+            (F::Crate, 0.0, 45.0),
         ],
         (B::Tent, 0) => &[
-            (F::Cot, -25.0, 0.0),
-            (F::Crate, 25.0, 0.0),
+            (F::Cot, -28.0, -8.0),
+            (F::Crate, 28.0, -8.0),
         ],
-        (B::Gas, 0) => &[(F::Counter, 0.0, -20.0)],
+        (B::Gas, 0) => &[
+            (F::Counter, 0.0, -20.0),
+            (F::Shelf, -55.0, 25.0),
+            (F::Shelf, 55.0, 25.0),
+            (F::Fridge, -90.0, -25.0),
+        ],
         _ => &[],
     }
 }
@@ -1699,7 +1589,7 @@ fn spawn_map(
         // signal comes from the door-frame markers below.
         let door_world = building_door_world(b);
         let side = building_door_side(b);
-        let door_tex = images.add(build_door_image(b.kind));
+        let door_tex = images.add(build_door_image(b.kind, side));
         let door_size = match side {
             WallSide::N | WallSide::S => Vec2::new(TILE_SIZE, BUILDING_WALL_THICK + 4.0),
             WallSide::E | WallSide::W => Vec2::new(BUILDING_WALL_THICK + 4.0, TILE_SIZE),
@@ -1791,6 +1681,9 @@ fn spawn_map(
                 }
                 let pos = Vec2::new(center.x + dx, center.y + dy);
                 let img = images.add(build_furniture_image(fk));
+                // Decorative items (rugs, paintings, plants, lamps) render
+                // beneath solid furniture so a chair on a rug reads correctly.
+                let z = if furniture_collides(fk) { -6.0 } else { -6.7 };
                 commands.spawn((
                     SpriteBundle {
                         texture: img,
@@ -1798,11 +1691,14 @@ fn spawn_map(
                             custom_size: Some(furn_half * 2.0),
                             ..default()
                         },
-                        transform: Transform::from_xyz(pos.x, pos.y, -6.0),
+                        transform: Transform::from_xyz(pos.x, pos.y, z),
                         ..default()
                     },
                     FloorEntity { building: idx, floor },
                 ));
+                if !furniture_collides(fk) {
+                    continue;
+                }
                 let shape = ObstacleShape::Rect(furn_half * 0.85);
                 let obs_idx = obstacles.list.len();
                 obstacles.list.push(Obstacle { pos, shape });
@@ -1964,6 +1860,11 @@ fn spawn_map(
         transform: Transform::from_xyz(0.0, 0.0, 20.5),
         ..default()
     });
+
+    // Build the spatial-grid index now that every obstacle is in place.
+    // Subsequent shape→Circle(0.0) transitions (toggle floor/roof, destroyed
+    // explodables) don't need a rebuild — the grid stores indices, not shapes.
+    obstacles.rebuild_grid();
 }
 
 fn build_stormcloud_image() -> Image {
@@ -2132,6 +2033,7 @@ fn reset_segment_state(
 
     let fog_tex = images.add(build_segment_fog_image());
     spawn_segment_fog_and_gates(&mut commands, &mut images, &mut obstacles, fog_tex);
+    obstacles.rebuild_grid();
 }
 
 fn update_segment_fog_visibility(
@@ -2416,11 +2318,11 @@ fn staircase_interact(
             continue;
         }
         let stair_pos = t.translation.truncate();
-        let dist = p.distance(stair_pos);
+        let dist_sq = p.distance_squared(stair_pos);
 
         // E-press: explicit floor advance from anywhere within the
         // generous interact radius.
-        if pressed && dist <= STAIR_INTERACT_RADIUS {
+        if pressed && dist_sq <= STAIR_INTERACT_RADIUS * STAIR_INTERACT_RADIUS {
             let kind = BUILDINGS[s.building].kind;
             let count = building_floor_count(kind);
             state.floor = (state.floor + 1) % count;
@@ -2432,7 +2334,7 @@ fn staircase_interact(
         // Auto-cycle: stepping directly onto the stair tile bumps you up
         // to the next floor automatically (with cooldown so you don't
         // teleport every tick while standing on it).
-        if dist <= STAIR_AUTO_RADIUS && state.stair_cooldown <= 0.0 {
+        if dist_sq <= STAIR_AUTO_RADIUS * STAIR_AUTO_RADIUS && state.stair_cooldown <= 0.0 {
             let kind = BUILDINGS[s.building].kind;
             let count = building_floor_count(kind);
             state.floor = (state.floor + 1) % count;
@@ -2541,22 +2443,24 @@ fn check_roof_fall(
 }
 
 fn update_building_roof_visibility(
-    mut roofs: Query<(&BuildingRoof, &mut Visibility)>,
+    mut roofs: Query<(&BuildingRoof, &mut Sprite, &mut Visibility)>,
     players: Query<(&Transform, &Player)>,
     ctx: Res<NetContext>,
+    time: Res<Time>,
 ) {
     let local_pos = players
         .iter()
         .find(|(_, p)| p.id == ctx.my_id)
         .or_else(|| players.iter().next())
         .map(|(t, _)| t.translation.truncate());
-    for (roof, mut vis) in roofs.iter_mut() {
+    let dt = time.delta_seconds();
+    for (roof, mut sprite, mut vis) in roofs.iter_mut() {
         let Some(b) = BUILDINGS.get(roof.idx) else {
             continue;
         };
         let (center, half) = building_world_rect(b);
-        // Margin = wall thickness so the roof only hides once the player
-        // is fully past the wall midline (avoids flicker right at the door).
+        // Margin = wall thickness so the cutout only kicks in once the
+        // player is fully past the wall midline (no flicker at the door).
         let margin = BUILDING_WALL_THICK;
         let inside = local_pos
             .map(|p| {
@@ -2564,11 +2468,19 @@ fn update_building_roof_visibility(
                     && (p.y - center.y).abs() < half.y - margin
             })
             .unwrap_or(false);
-        *vis = if inside {
-            Visibility::Hidden
-        } else {
-            Visibility::Inherited
-        };
+        // Smooth alpha tween: roof never hard-disappears.  When the player
+        // is inside, drop to ~0 alpha so the interior reads cleanly; when
+        // outside, return to full opacity.  Decay rate is fast enough that
+        // walking past the threshold feels responsive (~0.25 s).
+        let target_alpha: f32 = if inside { 0.0 } else { 1.0 };
+        let mut color = sprite.color.to_srgba();
+        let cur = color.alpha;
+        let step = (target_alpha - cur).clamp(-dt * 4.0, dt * 4.0);
+        color.alpha = (cur + step).clamp(0.0, 1.0);
+        sprite.color = color.into();
+        // Bevy still needs Visibility::Inherited so the sprite renders at
+        // all — we never set it to Hidden any more.
+        *vis = Visibility::Inherited;
     }
 }
 
@@ -2589,16 +2501,15 @@ fn refresh_segment_unlock_hint(
         return;
     };
     let mut best: Option<(u8, u32, f32)> = None;
+    let max_d2 = (SEGMENT_UNLOCK_RADIUS * 1.5).powi(2);
     for gate in GATES {
         if state.is_unlocked(gate.to_seg) {
             continue;
         }
         let bp = gate_world_pos(gate.from_seg);
-        let d = p.distance(bp);
-        if d <= SEGMENT_UNLOCK_RADIUS * 1.5
-            && best.map(|(_, _, bd)| d < bd).unwrap_or(true)
-        {
-            best = Some((gate.to_seg, gate.cost, d));
+        let d2 = p.distance_squared(bp);
+        if d2 <= max_d2 && best.map(|(_, _, bd2)| d2 < bd2).unwrap_or(true) {
+            best = Some((gate.to_seg, gate.cost, d2));
         }
     }
     match best {
@@ -2634,7 +2545,7 @@ fn unlock_segments_by_input(
         let pos = gate_world_pos(gate.from_seg);
         for (t, p) in players.iter() {
             let pp = t.translation.truncate();
-            if pp.distance(pos) > SEGMENT_UNLOCK_RADIUS {
+            if pp.distance_squared(pos) > SEGMENT_UNLOCK_RADIUS * SEGMENT_UNLOCK_RADIUS {
                 continue;
             }
             let pressed = if p.id == ctx.my_id {
@@ -2847,7 +2758,42 @@ fn furniture_half(kind: FurnKind) -> Vec2 {
         Barrels => Vec2::new(13.0, 13.0),
         Gurney => Vec2::new(13.0, 24.0),
         Bench => Vec2::new(28.0, 8.0),
+        Fridge => Vec2::new(13.0, 16.0),
+        Stove => Vec2::new(14.0, 12.0),
+        KitchenSink => Vec2::new(16.0, 9.0),
+        Toilet => Vec2::new(8.0, 11.0),
+        Bathtub => Vec2::new(22.0, 11.0),
+        BathSink => Vec2::new(13.0, 9.0),
+        Dresser => Vec2::new(20.0, 9.0),
+        Wardrobe => Vec2::new(15.0, 11.0),
+        Nightstand => Vec2::new(8.0, 8.0),
+        CoffeeTable => Vec2::new(16.0, 9.0),
+        Bookshelf => Vec2::new(18.0, 9.0),
+        DiningTable => Vec2::new(20.0, 14.0),
+        DiningChair => Vec2::new(7.0, 7.0),
+        ArmChair => Vec2::new(13.0, 12.0),
+        Fireplace => Vec2::new(20.0, 10.0),
+        // Decorative items still have a half-extent for sprite sizing,
+        // but `furniture_collides` returns false so they don't block
+        // movement.  Rugs/paintings should never push the player around.
+        FloorLamp => Vec2::new(6.0, 18.0),
+        Rug => Vec2::new(28.0, 20.0),
+        Plant => Vec2::new(9.0, 14.0),
+        Painting => Vec2::new(14.0, 4.0),
+        Trashcan => Vec2::new(6.0, 9.0),
+        FilingCabinet => Vec2::new(11.0, 9.0),
+        OfficeChair => Vec2::new(8.0, 9.0),
     }
+}
+
+/// Whether a furniture piece blocks movement.  Decorative items (rugs,
+/// floor lamps, plants, paintings) only spawn the sprite — `spawn_map`
+/// skips obstacle creation when this returns false.
+fn furniture_collides(kind: FurnKind) -> bool {
+    !matches!(
+        kind,
+        FurnKind::Rug | FurnKind::Painting | FurnKind::FloorLamp | FurnKind::Plant
+    )
 }
 
 fn build_furniture_image(kind: FurnKind) -> Image {
@@ -2864,6 +2810,28 @@ fn build_furniture_image(kind: FurnKind) -> Image {
         FurnKind::Barrels => build_barrels(),
         FurnKind::Gurney => build_gurney(),
         FurnKind::Bench => build_bench(),
+        FurnKind::Fridge => build_fridge(),
+        FurnKind::Stove => build_stove(),
+        FurnKind::KitchenSink => build_kitchen_sink(),
+        FurnKind::Toilet => build_toilet(),
+        FurnKind::Bathtub => build_bathtub(),
+        FurnKind::BathSink => build_bath_sink(),
+        FurnKind::Dresser => build_dresser(),
+        FurnKind::Wardrobe => build_wardrobe(),
+        FurnKind::Nightstand => build_nightstand(),
+        FurnKind::CoffeeTable => build_coffee_table(),
+        FurnKind::Bookshelf => build_bookshelf(),
+        FurnKind::DiningTable => build_dining_table(),
+        FurnKind::DiningChair => build_dining_chair(),
+        FurnKind::ArmChair => build_armchair(),
+        FurnKind::Fireplace => build_fireplace(),
+        FurnKind::FloorLamp => build_floor_lamp(),
+        FurnKind::Rug => build_rug(),
+        FurnKind::Plant => build_plant(),
+        FurnKind::Painting => build_painting(),
+        FurnKind::Trashcan => build_trashcan(),
+        FurnKind::FilingCabinet => build_filing_cabinet(),
+        FurnKind::OfficeChair => build_office_chair(),
     }
 }
 
@@ -3030,6 +2998,540 @@ fn build_altar() -> Image {
         c.put(x, 3, flame);
         c.put(x + 1, 3, flame);
     }
+    c.into_image()
+}
+
+// ──── Kitchen ─────────────────────────────────────────────────────────────
+
+fn build_fridge() -> Image {
+    let body: Rgba = [220, 220, 224, 255];
+    let body_d: Rgba = [150, 150, 156, 255];
+    let body_h: Rgba = [248, 248, 250, 255];
+    let handle: Rgba = [60, 62, 70, 255];
+    let mut c = Canvas::new(26, 32);
+    c.fill_rect(0, 0, 26, 32, [0, 0, 0, 0]);
+    c.fill_rect(0, 0, 26, 32, body);
+    c.fill_rect(0, 0, 26, 1, body_d);
+    c.fill_rect(0, 31, 26, 1, body_d);
+    c.fill_rect(0, 0, 1, 32, body_d);
+    c.fill_rect(25, 0, 1, 32, body_d);
+    // Highlight column
+    c.fill_rect(2, 1, 1, 30, body_h);
+    // Door split
+    c.fill_rect(0, 12, 26, 1, body_d);
+    // Handles
+    c.fill_rect(20, 4, 2, 6, handle);
+    c.fill_rect(20, 16, 2, 12, handle);
+    c.into_image()
+}
+
+fn build_stove() -> Image {
+    let body: Rgba = [80, 82, 90, 255];
+    let body_d: Rgba = [40, 42, 50, 255];
+    let panel: Rgba = [160, 160, 170, 255];
+    let burner: Rgba = [30, 32, 36, 255];
+    let burner_glow: Rgba = [220, 90, 40, 255];
+    let mut c = Canvas::new(28, 24);
+    c.fill_rect(0, 0, 28, 24, [0, 0, 0, 0]);
+    c.fill_rect(0, 0, 28, 24, body);
+    c.fill_rect(0, 0, 28, 1, body_d);
+    c.fill_rect(0, 23, 28, 1, body_d);
+    // Top panel
+    c.fill_rect(2, 2, 24, 12, panel);
+    // 4 burners
+    for &(x, y, glow) in &[(4, 4, false), (16, 4, true), (4, 8, false), (16, 8, false)] {
+        c.fill_rect(x, y, 5, 4, burner);
+        if glow {
+            c.fill_rect(x + 1, y + 1, 3, 2, burner_glow);
+        }
+    }
+    // Oven door
+    c.fill_rect(2, 16, 24, 6, [60, 60, 68, 255]);
+    c.fill_rect(4, 18, 20, 2, [180, 180, 200, 255]);
+    c.into_image()
+}
+
+fn build_kitchen_sink() -> Image {
+    let counter: Rgba = [196, 188, 168, 255];
+    let counter_d: Rgba = [120, 112, 92, 255];
+    let basin: Rgba = [180, 184, 196, 255];
+    let basin_d: Rgba = [104, 110, 124, 255];
+    let tap: Rgba = [200, 200, 210, 255];
+    let mut c = Canvas::new(32, 18);
+    c.fill_rect(0, 0, 32, 18, [0, 0, 0, 0]);
+    c.fill_rect(0, 0, 32, 18, counter);
+    c.fill_rect(0, 0, 32, 1, counter_d);
+    c.fill_rect(0, 17, 32, 1, counter_d);
+    // Basin
+    c.fill_rect(6, 4, 20, 10, basin);
+    c.fill_rect(6, 4, 20, 1, basin_d);
+    c.fill_rect(6, 13, 20, 1, basin_d);
+    c.fill_rect(6, 4, 1, 10, basin_d);
+    c.fill_rect(25, 4, 1, 10, basin_d);
+    // Tap
+    c.fill_rect(15, 0, 2, 4, tap);
+    c.fill_rect(13, 4, 6, 1, tap);
+    c.into_image()
+}
+
+// ──── Bathroom ────────────────────────────────────────────────────────────
+
+fn build_toilet() -> Image {
+    let porcelain: Rgba = [240, 240, 244, 255];
+    let porcelain_d: Rgba = [180, 180, 188, 255];
+    let seat: Rgba = [255, 255, 255, 255];
+    let mut c = Canvas::new(16, 22);
+    c.fill_rect(0, 0, 16, 22, [0, 0, 0, 0]);
+    // Tank (back)
+    c.fill_rect(2, 0, 12, 8, porcelain);
+    c.fill_rect(2, 0, 12, 1, porcelain_d);
+    c.fill_rect(2, 7, 12, 1, porcelain_d);
+    // Bowl (oval-ish)
+    c.fill_rect(3, 8, 10, 12, porcelain);
+    c.fill_rect(2, 10, 12, 8, porcelain);
+    c.fill_rect(2, 10, 12, 1, porcelain_d);
+    c.fill_rect(2, 17, 12, 1, porcelain_d);
+    // Seat highlight
+    c.fill_rect(4, 11, 8, 5, seat);
+    c.into_image()
+}
+
+fn build_bathtub() -> Image {
+    let porcelain: Rgba = [238, 238, 242, 255];
+    let porcelain_d: Rgba = [170, 170, 178, 255];
+    let water: Rgba = [120, 170, 210, 255];
+    let water_h: Rgba = [180, 220, 240, 255];
+    let mut c = Canvas::new(44, 22);
+    c.fill_rect(0, 0, 44, 22, [0, 0, 0, 0]);
+    c.fill_rect(0, 0, 44, 22, porcelain);
+    c.fill_rect(0, 0, 44, 1, porcelain_d);
+    c.fill_rect(0, 21, 44, 1, porcelain_d);
+    c.fill_rect(0, 0, 1, 22, porcelain_d);
+    c.fill_rect(43, 0, 1, 22, porcelain_d);
+    // Inner basin filled with water
+    c.fill_rect(3, 3, 38, 16, water);
+    c.fill_rect(3, 3, 38, 1, water_h);
+    c.fill_rect(3, 18, 38, 1, porcelain_d);
+    // Tap on the right side
+    c.fill_rect(38, 8, 4, 2, [200, 200, 210, 255]);
+    c.fill_rect(40, 6, 2, 5, [200, 200, 210, 255]);
+    c.into_image()
+}
+
+fn build_bath_sink() -> Image {
+    let cabinet: Rgba = [110, 78, 50, 255];
+    let cabinet_d: Rgba = [62, 42, 22, 255];
+    let basin: Rgba = [240, 240, 244, 255];
+    let basin_d: Rgba = [170, 170, 180, 255];
+    let mirror: Rgba = [180, 200, 220, 255];
+    let mut c = Canvas::new(26, 18);
+    c.fill_rect(0, 0, 26, 18, [0, 0, 0, 0]);
+    // Mirror above
+    c.fill_rect(4, 0, 18, 4, mirror);
+    c.fill_rect(4, 0, 18, 1, [120, 130, 150, 255]);
+    // Basin
+    c.fill_rect(2, 4, 22, 6, basin);
+    c.fill_rect(2, 4, 22, 1, basin_d);
+    c.fill_rect(2, 9, 22, 1, basin_d);
+    // Cabinet
+    c.fill_rect(2, 10, 22, 8, cabinet);
+    c.fill_rect(2, 10, 22, 1, cabinet_d);
+    c.fill_rect(2, 17, 22, 1, cabinet_d);
+    c.fill_rect(12, 12, 2, 4, cabinet_d);
+    c.into_image()
+}
+
+// ──── Bedroom ─────────────────────────────────────────────────────────────
+
+fn build_dresser() -> Image {
+    let body: Rgba = [110, 76, 44, 255];
+    let body_d: Rgba = [62, 40, 22, 255];
+    let body_h: Rgba = [156, 110, 66, 255];
+    let knob: Rgba = [212, 188, 96, 255];
+    let mut c = Canvas::new(40, 18);
+    c.fill_rect(0, 0, 40, 18, [0, 0, 0, 0]);
+    c.fill_rect(0, 0, 40, 18, body);
+    c.fill_rect(0, 0, 40, 2, body_h);
+    c.fill_rect(0, 0, 40, 1, body_d);
+    c.fill_rect(0, 17, 40, 1, body_d);
+    c.fill_rect(0, 0, 1, 18, body_d);
+    c.fill_rect(39, 0, 1, 18, body_d);
+    // 3 drawers
+    for &y in &[3i32, 9] {
+        for col in 0..3 {
+            let x = 3 + col * 12;
+            c.fill_rect(x, y, 10, 4, body_h);
+            c.fill_rect(x, y, 10, 1, body_d);
+            c.fill_rect(x, y + 3, 10, 1, body_d);
+            c.put(x + 4, y + 1, knob);
+            c.put(x + 5, y + 1, knob);
+        }
+    }
+    c.into_image()
+}
+
+fn build_wardrobe() -> Image {
+    let body: Rgba = [88, 60, 36, 255];
+    let body_d: Rgba = [48, 30, 16, 255];
+    let body_h: Rgba = [136, 92, 56, 255];
+    let knob: Rgba = [212, 188, 96, 255];
+    let mut c = Canvas::new(30, 22);
+    c.fill_rect(0, 0, 30, 22, [0, 0, 0, 0]);
+    c.fill_rect(0, 0, 30, 22, body);
+    c.fill_rect(0, 0, 30, 1, body_d);
+    c.fill_rect(0, 21, 30, 1, body_d);
+    c.fill_rect(0, 0, 1, 22, body_d);
+    c.fill_rect(29, 0, 1, 22, body_d);
+    // Two doors
+    c.fill_rect(2, 2, 12, 18, body_h);
+    c.fill_rect(16, 2, 12, 18, body_h);
+    c.fill_rect(14, 0, 2, 22, body_d);
+    c.put(11, 11, knob);
+    c.put(18, 11, knob);
+    c.into_image()
+}
+
+fn build_nightstand() -> Image {
+    let body: Rgba = [110, 76, 44, 255];
+    let body_d: Rgba = [62, 40, 22, 255];
+    let top: Rgba = [156, 110, 66, 255];
+    let knob: Rgba = [212, 188, 96, 255];
+    let mut c = Canvas::new(16, 16);
+    c.fill_rect(0, 0, 16, 16, [0, 0, 0, 0]);
+    c.fill_rect(0, 0, 16, 16, body);
+    c.fill_rect(0, 0, 16, 2, top);
+    c.fill_rect(0, 0, 16, 1, body_d);
+    c.fill_rect(0, 15, 16, 1, body_d);
+    c.fill_rect(0, 0, 1, 16, body_d);
+    c.fill_rect(15, 0, 1, 16, body_d);
+    // Drawer
+    c.fill_rect(3, 5, 10, 6, top);
+    c.fill_rect(3, 5, 10, 1, body_d);
+    c.put(7, 8, knob);
+    c.put(8, 8, knob);
+    c.into_image()
+}
+
+// ──── Living / dining ─────────────────────────────────────────────────────
+
+fn build_coffee_table() -> Image {
+    let top: Rgba = [156, 110, 66, 255];
+    let top_d: Rgba = [88, 56, 30, 255];
+    let book_a: Rgba = [200, 80, 60, 255];
+    let book_b: Rgba = [80, 130, 200, 255];
+    let mut c = Canvas::new(32, 18);
+    c.fill_rect(0, 0, 32, 18, [0, 0, 0, 0]);
+    c.fill_rect(2, 2, 28, 14, top);
+    c.fill_rect(2, 2, 28, 1, top_d);
+    c.fill_rect(2, 15, 28, 1, top_d);
+    c.fill_rect(2, 2, 1, 14, top_d);
+    c.fill_rect(29, 2, 1, 14, top_d);
+    // Magazines on table
+    c.fill_rect(6, 5, 8, 4, book_a);
+    c.fill_rect(16, 7, 10, 5, book_b);
+    c.into_image()
+}
+
+fn build_bookshelf() -> Image {
+    let frame: Rgba = [88, 56, 30, 255];
+    let frame_d: Rgba = [50, 30, 14, 255];
+    let shelf: Rgba = [120, 80, 44, 255];
+    let book_a: Rgba = [180, 60, 50, 255];
+    let book_b: Rgba = [60, 120, 180, 255];
+    let book_c: Rgba = [200, 170, 80, 255];
+    let book_d: Rgba = [80, 150, 90, 255];
+    let mut c = Canvas::new(36, 18);
+    c.fill_rect(0, 0, 36, 18, [0, 0, 0, 0]);
+    c.fill_rect(0, 0, 36, 18, frame);
+    c.fill_rect(0, 0, 36, 1, frame_d);
+    c.fill_rect(0, 17, 36, 1, frame_d);
+    c.fill_rect(0, 0, 1, 18, frame_d);
+    c.fill_rect(35, 0, 1, 18, frame_d);
+    // Shelf divider
+    c.fill_rect(1, 8, 34, 1, shelf);
+    // Top row of books
+    let cols_top = [(2, book_a, 3), (5, book_b, 2), (7, book_c, 4), (11, book_d, 3),
+                    (14, book_a, 2), (16, book_b, 3), (19, book_c, 4), (23, book_d, 2),
+                    (25, book_a, 3), (28, book_b, 4), (32, book_c, 2)];
+    for &(x, col, w) in &cols_top {
+        c.fill_rect(x, 1, w, 6, col);
+    }
+    // Bottom row — alternate colors
+    let cols_bot = [(2, book_b, 3), (5, book_c, 2), (7, book_d, 4), (11, book_a, 3),
+                    (14, book_b, 2), (16, book_c, 3), (19, book_d, 4), (23, book_a, 2),
+                    (25, book_b, 3), (28, book_c, 4), (32, book_d, 2)];
+    for &(x, col, w) in &cols_bot {
+        c.fill_rect(x, 9, w, 6, col);
+    }
+    c.into_image()
+}
+
+fn build_dining_table() -> Image {
+    let top: Rgba = [148, 100, 58, 255];
+    let top_d: Rgba = [82, 52, 28, 255];
+    let cloth: Rgba = [220, 218, 208, 255];
+    let plate: Rgba = [240, 240, 240, 255];
+    let mut c = Canvas::new(40, 28);
+    c.fill_rect(0, 0, 40, 28, [0, 0, 0, 0]);
+    c.fill_rect(2, 2, 36, 24, top);
+    c.fill_rect(2, 2, 36, 1, top_d);
+    c.fill_rect(2, 25, 36, 1, top_d);
+    c.fill_rect(2, 2, 1, 24, top_d);
+    c.fill_rect(37, 2, 1, 24, top_d);
+    // Tablecloth runner
+    c.fill_rect(8, 4, 24, 20, cloth);
+    // Plates
+    c.fill_rect(11, 8, 5, 4, plate);
+    c.fill_rect(24, 8, 5, 4, plate);
+    c.fill_rect(11, 16, 5, 4, plate);
+    c.fill_rect(24, 16, 5, 4, plate);
+    c.into_image()
+}
+
+fn build_dining_chair() -> Image {
+    let body: Rgba = [108, 72, 42, 255];
+    let body_d: Rgba = [64, 40, 22, 255];
+    let cushion: Rgba = [180, 70, 60, 255];
+    let mut c = Canvas::new(14, 14);
+    c.fill_rect(0, 0, 14, 14, [0, 0, 0, 0]);
+    // Backrest
+    c.fill_rect(1, 0, 12, 4, body);
+    c.fill_rect(1, 0, 12, 1, body_d);
+    // Seat
+    c.fill_rect(0, 4, 14, 8, body);
+    c.fill_rect(0, 4, 14, 1, body_d);
+    c.fill_rect(2, 6, 10, 4, cushion);
+    // Legs
+    c.fill_rect(0, 12, 2, 2, body_d);
+    c.fill_rect(12, 12, 2, 2, body_d);
+    c.into_image()
+}
+
+fn build_armchair() -> Image {
+    let body: Rgba = [70, 90, 130, 255];
+    let body_d: Rgba = [38, 50, 78, 255];
+    let body_h: Rgba = [110, 140, 180, 255];
+    let cushion: Rgba = [140, 170, 200, 255];
+    let mut c = Canvas::new(26, 24);
+    c.fill_rect(0, 0, 26, 24, [0, 0, 0, 0]);
+    // Back
+    c.fill_rect(2, 0, 22, 8, body);
+    c.fill_rect(2, 0, 22, 2, body_h);
+    // Arms
+    c.fill_rect(0, 6, 5, 16, body);
+    c.fill_rect(21, 6, 5, 16, body);
+    // Seat
+    c.fill_rect(5, 8, 16, 14, body_d);
+    c.fill_rect(6, 10, 14, 10, cushion);
+    c.fill_rect(6, 10, 14, 1, body_h);
+    c.fill_rect(0, 22, 26, 2, body_d);
+    c.into_image()
+}
+
+fn build_fireplace() -> Image {
+    let stone: Rgba = [128, 124, 116, 255];
+    let stone_d: Rgba = [78, 74, 68, 255];
+    let stone_h: Rgba = [168, 162, 152, 255];
+    let inside: Rgba = [30, 22, 18, 255];
+    let log: Rgba = [88, 56, 30, 255];
+    let flame: Rgba = [232, 168, 60, 255];
+    let flame_h: Rgba = [255, 230, 130, 255];
+    let mut c = Canvas::new(40, 22);
+    c.fill_rect(0, 0, 40, 22, [0, 0, 0, 0]);
+    // Stone surround
+    c.fill_rect(0, 0, 40, 22, stone);
+    c.fill_rect(0, 0, 40, 2, stone_h);
+    c.fill_rect(0, 20, 40, 2, stone_d);
+    // Stone block pattern
+    for col in 0..5 {
+        c.fill_rect(col * 8, 2, 1, 18, stone_d);
+    }
+    c.fill_rect(0, 11, 40, 1, stone_d);
+    // Hearth opening
+    c.fill_rect(8, 5, 24, 14, inside);
+    c.fill_rect(8, 5, 24, 1, stone_d);
+    // Logs
+    c.fill_rect(11, 14, 18, 3, log);
+    c.fill_rect(11, 14, 18, 1, [60, 36, 16, 255]);
+    // Flames
+    c.fill_rect(13, 9, 4, 6, flame);
+    c.fill_rect(20, 8, 4, 7, flame);
+    c.fill_rect(25, 10, 3, 5, flame);
+    c.fill_rect(15, 11, 2, 3, flame_h);
+    c.fill_rect(21, 10, 2, 4, flame_h);
+    c.into_image()
+}
+
+// ──── Decorative (no collision) ───────────────────────────────────────────
+
+fn build_floor_lamp() -> Image {
+    let stand: Rgba = [60, 60, 68, 255];
+    let shade: Rgba = [220, 200, 130, 255];
+    let shade_h: Rgba = [255, 240, 180, 255];
+    let glow: Rgba = [255, 230, 150, 200];
+    let mut c = Canvas::new(12, 36);
+    c.fill_rect(0, 0, 12, 36, [0, 0, 0, 0]);
+    // Base
+    c.fill_rect(3, 33, 6, 3, stand);
+    c.fill_rect(2, 35, 8, 1, stand);
+    // Pole
+    c.fill_rect(5, 8, 2, 26, stand);
+    // Shade (cone-like)
+    c.fill_rect(2, 0, 8, 8, shade);
+    c.fill_rect(2, 0, 8, 1, shade_h);
+    c.fill_rect(1, 1, 1, 6, shade);
+    c.fill_rect(10, 1, 1, 6, shade);
+    // Glow halo
+    c.fill_rect(3, 8, 6, 2, glow);
+    c.into_image()
+}
+
+fn build_rug() -> Image {
+    let outer: Rgba = [148, 60, 50, 255];
+    let inner: Rgba = [200, 90, 70, 255];
+    let core: Rgba = [232, 200, 130, 255];
+    let dark: Rgba = [88, 30, 24, 255];
+    let mut c = Canvas::new(56, 40);
+    c.fill_rect(0, 0, 56, 40, [0, 0, 0, 0]);
+    c.fill_rect(0, 0, 56, 40, outer);
+    c.fill_rect(2, 2, 52, 36, inner);
+    c.fill_rect(6, 6, 44, 28, core);
+    // Border lines
+    c.fill_rect(0, 0, 56, 1, dark);
+    c.fill_rect(0, 39, 56, 1, dark);
+    c.fill_rect(0, 0, 1, 40, dark);
+    c.fill_rect(55, 0, 1, 40, dark);
+    // Pattern dots
+    for x in [12, 22, 32, 42] {
+        c.fill_rect(x, 14, 2, 2, outer);
+        c.fill_rect(x, 24, 2, 2, outer);
+    }
+    // Tassels (top + bottom)
+    for x in (1..56).step_by(3) {
+        c.put(x, 0, dark);
+        c.put(x, 39, dark);
+    }
+    c.into_image()
+}
+
+fn build_plant() -> Image {
+    let pot: Rgba = [140, 80, 50, 255];
+    let pot_d: Rgba = [82, 46, 26, 255];
+    let leaf: Rgba = [54, 130, 60, 255];
+    let leaf_h: Rgba = [110, 180, 80, 255];
+    let leaf_d: Rgba = [30, 80, 38, 255];
+    let mut c = Canvas::new(18, 28);
+    c.fill_rect(0, 0, 18, 28, [0, 0, 0, 0]);
+    // Pot
+    c.fill_rect(3, 18, 12, 10, pot);
+    c.fill_rect(3, 18, 12, 1, [180, 110, 70, 255]);
+    c.fill_rect(3, 27, 12, 1, pot_d);
+    c.fill_rect(3, 18, 1, 10, pot_d);
+    c.fill_rect(14, 18, 1, 10, pot_d);
+    // Leaves — a few overlapping ovals
+    c.fill_rect(7, 0, 4, 12, leaf);
+    c.fill_rect(2, 4, 5, 10, leaf);
+    c.fill_rect(11, 4, 5, 10, leaf);
+    c.fill_rect(4, 8, 3, 8, leaf_h);
+    c.fill_rect(11, 8, 3, 8, leaf_h);
+    c.fill_rect(8, 1, 2, 10, leaf_h);
+    c.fill_rect(0, 9, 2, 6, leaf_d);
+    c.fill_rect(16, 9, 2, 6, leaf_d);
+    c.into_image()
+}
+
+fn build_painting() -> Image {
+    let frame: Rgba = [212, 188, 96, 255];
+    let frame_d: Rgba = [148, 124, 50, 255];
+    let sky: Rgba = [110, 160, 200, 255];
+    let mountain: Rgba = [120, 100, 80, 255];
+    let snow: Rgba = [240, 240, 245, 255];
+    let mut c = Canvas::new(28, 8);
+    c.fill_rect(0, 0, 28, 8, [0, 0, 0, 0]);
+    c.fill_rect(0, 0, 28, 8, frame);
+    c.fill_rect(0, 0, 28, 1, frame_d);
+    c.fill_rect(0, 7, 28, 1, frame_d);
+    // Inner painting
+    c.fill_rect(2, 2, 24, 4, sky);
+    // Mountains
+    c.fill_rect(4, 3, 6, 3, mountain);
+    c.fill_rect(10, 4, 8, 2, mountain);
+    c.fill_rect(18, 3, 6, 3, mountain);
+    // Snow caps
+    c.put(6, 3, snow);
+    c.put(7, 3, snow);
+    c.put(20, 3, snow);
+    c.put(21, 3, snow);
+    c.into_image()
+}
+
+// ──── Misc ────────────────────────────────────────────────────────────────
+
+fn build_trashcan() -> Image {
+    let body: Rgba = [80, 84, 88, 255];
+    let body_d: Rgba = [40, 44, 48, 255];
+    let lid: Rgba = [120, 124, 130, 255];
+    let mut c = Canvas::new(12, 18);
+    c.fill_rect(0, 0, 12, 18, [0, 0, 0, 0]);
+    c.fill_rect(1, 2, 10, 14, body);
+    c.fill_rect(1, 2, 10, 1, body_d);
+    c.fill_rect(1, 15, 10, 1, body_d);
+    c.fill_rect(1, 2, 1, 14, body_d);
+    c.fill_rect(10, 2, 1, 14, body_d);
+    // Vertical ribs
+    c.fill_rect(4, 4, 1, 10, body_d);
+    c.fill_rect(7, 4, 1, 10, body_d);
+    // Lid
+    c.fill_rect(0, 0, 12, 2, lid);
+    c.fill_rect(0, 1, 12, 1, body_d);
+    c.into_image()
+}
+
+fn build_filing_cabinet() -> Image {
+    let body: Rgba = [90, 92, 100, 255];
+    let body_d: Rgba = [54, 56, 64, 255];
+    let body_h: Rgba = [128, 130, 138, 255];
+    let knob: Rgba = [212, 188, 96, 255];
+    let label: Rgba = [220, 220, 220, 255];
+    let mut c = Canvas::new(22, 18);
+    c.fill_rect(0, 0, 22, 18, [0, 0, 0, 0]);
+    c.fill_rect(0, 0, 22, 18, body);
+    c.fill_rect(0, 0, 22, 1, body_h);
+    c.fill_rect(0, 17, 22, 1, body_d);
+    c.fill_rect(0, 0, 1, 18, body_d);
+    c.fill_rect(21, 0, 1, 18, body_d);
+    // Drawer dividers
+    c.fill_rect(0, 6, 22, 1, body_d);
+    c.fill_rect(0, 12, 22, 1, body_d);
+    // Labels and knobs
+    for &y in &[2i32, 8, 14] {
+        c.fill_rect(7, y, 8, 2, label);
+        c.put(18, y + 1, knob);
+        c.put(19, y + 1, knob);
+    }
+    c.into_image()
+}
+
+fn build_office_chair() -> Image {
+    let body: Rgba = [40, 42, 48, 255];
+    let body_d: Rgba = [22, 22, 28, 255];
+    let cushion: Rgba = [70, 90, 130, 255];
+    let cushion_h: Rgba = [110, 140, 180, 255];
+    let mut c = Canvas::new(16, 18);
+    c.fill_rect(0, 0, 16, 18, [0, 0, 0, 0]);
+    // Backrest
+    c.fill_rect(3, 0, 10, 6, cushion);
+    c.fill_rect(3, 0, 10, 1, cushion_h);
+    c.fill_rect(3, 0, 1, 6, body_d);
+    c.fill_rect(12, 0, 1, 6, body_d);
+    // Seat
+    c.fill_rect(2, 6, 12, 6, cushion);
+    c.fill_rect(2, 6, 12, 1, cushion_h);
+    c.fill_rect(2, 11, 12, 1, body_d);
+    // Star base
+    c.fill_rect(7, 12, 2, 4, body);
+    c.fill_rect(0, 16, 16, 2, body);
+    c.fill_rect(0, 17, 16, 1, body_d);
     c.into_image()
 }
 
@@ -3274,26 +3776,30 @@ fn build_roof_vent_image() -> Image {
 }
 
 fn build_door_frame_image() -> Image {
-    // Two short jambs with a darker stone sill in the middle — reads as
-    // "this is the entrance" without a giant floating panel.
-    let frame: Rgba = [148, 124, 86, 255];
-    let frame_d: Rgba = [78, 60, 36, 255];
-    let frame_h: Rgba = [196, 168, 124, 255];
-    let mut c = Canvas::new(40, 8);
-    c.fill_rect(0, 0, 40, 8, [0, 0, 0, 0]);
-    // Left jamb
-    c.fill_rect(0, 1, 6, 6, frame);
-    c.fill_rect(0, 1, 6, 1, frame_h);
-    c.fill_rect(0, 6, 6, 1, frame_d);
-    c.fill_rect(0, 1, 1, 6, frame_d);
-    // Right jamb
-    c.fill_rect(34, 1, 6, 6, frame);
-    c.fill_rect(34, 1, 6, 1, frame_h);
-    c.fill_rect(34, 6, 6, 1, frame_d);
-    c.fill_rect(39, 1, 1, 6, frame_d);
-    // Connecting sill (darker)
-    c.fill_rect(6, 3, 28, 2, frame_d);
-    c.fill_rect(6, 3, 28, 1, [42, 32, 22, 255]);
+    // Stone threshold with two clear jambs flanking the doorway opening.
+    // Drawn just outside the wall so the entrance is unambiguous.
+    let stone: Rgba = [156, 152, 144, 255];
+    let stone_d: Rgba = [88, 84, 78, 255];
+    let stone_h: Rgba = [200, 196, 188, 255];
+    let mut c = Canvas::new(40, 10);
+    c.fill_rect(0, 0, 40, 10, [0, 0, 0, 0]);
+    // Left jamb (chunky stone block)
+    c.fill_rect(0, 0, 7, 10, stone);
+    c.fill_rect(0, 0, 7, 1, stone_h);
+    c.fill_rect(0, 9, 7, 1, stone_d);
+    c.fill_rect(0, 0, 1, 10, stone_d);
+    // Inner block detail
+    c.fill_rect(2, 4, 3, 1, stone_d);
+    // Right jamb mirror
+    c.fill_rect(33, 0, 7, 10, stone);
+    c.fill_rect(33, 0, 7, 1, stone_h);
+    c.fill_rect(33, 9, 7, 1, stone_d);
+    c.fill_rect(39, 0, 1, 10, stone_d);
+    c.fill_rect(35, 4, 3, 1, stone_d);
+    // Threshold step (low stone band linking the jambs)
+    c.fill_rect(7, 3, 26, 4, stone_d);
+    c.fill_rect(7, 3, 26, 1, [62, 58, 54, 255]);
+    c.fill_rect(7, 6, 26, 1, [42, 40, 38, 255]);
     c.into_image()
 }
 
@@ -3315,19 +3821,71 @@ fn build_welcome_mat_image() -> Image {
     c.into_image()
 }
 
-fn build_door_image(kind: BuildingType) -> Image {
-    let (_, roof, dark, _) = building_palette(kind);
-    let mut c = Canvas::new(16, 16);
-    c.fill_rect(0, 0, 16, 16, [0, 0, 0, 0]);
-    c.fill_rect(2, 4, 12, 12, roof);
-    c.fill_rect(2, 4, 12, 1, dark);
-    c.fill_rect(2, 15, 12, 1, dark);
-    c.fill_rect(2, 4, 1, 12, dark);
-    c.fill_rect(13, 4, 1, 12, dark);
-    // Knob
-    c.put(11, 10, [220, 188, 70, 255]);
-    c.put(11, 11, [120, 96, 30, 255]);
-    c.into_image()
+fn build_door_image(kind: BuildingType, side: WallSide) -> Image {
+    // Doors are rendered with custom_size matching their wall slot, so we
+    // build the canvas at the same aspect (32×16 for N/S walls, 16×32 for
+    // E/W) — that way the planks and knob don't stretch into ovals.
+    let (_, panel, dark, trim) = building_palette(kind);
+    let plank_hi: Rgba = [
+        ((panel[0] as i32 + 30).min(255)) as u8,
+        ((panel[1] as i32 + 22).min(255)) as u8,
+        ((panel[2] as i32 + 16).min(255)) as u8,
+        255,
+    ];
+    let knob = [220, 188, 70, 255];
+    let knob_d = [120, 96, 30, 255];
+    let hinge = [50, 50, 56, 255];
+
+    match side {
+        WallSide::N | WallSide::S => {
+            // Horizontal door: 32 wide × 16 tall.  Planks run vertically
+            // (top→bottom of canvas) so the door reads as a wide threshold.
+            let mut c = Canvas::new(32, 16);
+            c.fill_rect(0, 0, 32, 16, [0, 0, 0, 0]);
+            // Outer frame
+            c.fill_rect(1, 1, 30, 14, dark);
+            c.fill_rect(2, 2, 28, 12, panel);
+            // Plank seams (3 planks)
+            for px in [10, 20] {
+                c.fill_rect(px, 2, 1, 12, dark);
+                c.fill_rect(px - 1, 2, 1, 12, plank_hi);
+            }
+            // Highlight along the top edge of each plank
+            c.fill_rect(2, 2, 28, 1, plank_hi);
+            // Hinges on the left side
+            c.fill_rect(2, 4, 3, 2, hinge);
+            c.fill_rect(2, 10, 3, 2, hinge);
+            // Knob on the right (slightly inset)
+            c.fill_rect(26, 7, 2, 2, knob);
+            c.put(28, 8, knob_d);
+            // Decorative trim band (matches roof palette so doors feel
+            // tied to the rest of the building).
+            c.fill_rect(2, 8, 28, 1, trim);
+            c.into_image()
+        }
+        WallSide::E | WallSide::W => {
+            // Vertical door: 16 wide × 32 tall.  Planks run horizontally
+            // (left→right of canvas) which matches a side-hung door panel.
+            let mut c = Canvas::new(16, 32);
+            c.fill_rect(0, 0, 16, 32, [0, 0, 0, 0]);
+            c.fill_rect(1, 1, 14, 30, dark);
+            c.fill_rect(2, 2, 12, 28, panel);
+            for py in [10, 20] {
+                c.fill_rect(2, py, 12, 1, dark);
+                c.fill_rect(2, py - 1, 12, 1, plank_hi);
+            }
+            c.fill_rect(2, 2, 1, 28, plank_hi);
+            // Hinges on top side
+            c.fill_rect(4, 2, 2, 3, hinge);
+            c.fill_rect(10, 2, 2, 3, hinge);
+            // Knob near bottom
+            c.fill_rect(7, 26, 2, 2, knob);
+            c.put(8, 28, knob_d);
+            // Trim band
+            c.fill_rect(2, 16, 12, 1, trim);
+            c.into_image()
+        }
+    }
 }
 
 fn build_roof_image(kind: BuildingType, style: RoofStyle, w_tiles: i32, h_tiles: i32) -> Image {
@@ -3340,61 +3898,145 @@ fn build_roof_image(kind: BuildingType, style: RoofStyle, w_tiles: i32, h_tiles:
 
     match style {
         RoofStyle::Gable => {
+            // Real terracotta-tile roof: two slopes split by a ridge cap,
+            // each slope filled with staggered scalloped dachówka rows.
+            // Side facing the camera is brighter; far side darker for depth.
             let horiz = w >= h;
+            let near = roof;
+            let far: Rgba = [
+                ((roof[0] as f32 * 0.65) as u8),
+                ((roof[1] as f32 * 0.65) as u8),
+                ((roof[2] as f32 * 0.65) as u8),
+                255,
+            ];
+            let near_d: Rgba = [
+                ((roof[0] as f32 * 0.78) as u8),
+                ((roof[1] as f32 * 0.78) as u8),
+                ((roof[2] as f32 * 0.78) as u8),
+                255,
+            ];
+            let far_d: Rgba = [
+                ((roof[0] as f32 * 0.45) as u8),
+                ((roof[1] as f32 * 0.45) as u8),
+                ((roof[2] as f32 * 0.45) as u8),
+                255,
+            ];
+            let ridge = dark;
+            let ridge_h: Rgba = [
+                ((dark[0] as i32 + 40).min(255)) as u8,
+                ((dark[1] as i32 + 40).min(255)) as u8,
+                ((dark[2] as i32 + 40).min(255)) as u8,
+                255,
+            ];
+            let smoke = [80, 80, 84, 200];
+
+            let draw_dachówka = |c: &mut Canvas, x0: i32, y0: i32, w: i32, h: i32,
+                                 base: Rgba, base_d: Rgba| {
+                c.fill_rect(x0, y0, w, h, base);
+                // Tile rows ~3 px tall, staggered every other row by 2 px.
+                let row_h = 3;
+                let tile_w = 4;
+                let mut y = y0;
+                let mut row_idx = 0i32;
+                while y < y0 + h {
+                    let rh = row_h.min(y0 + h - y);
+                    let offset = if row_idx % 2 == 0 { 0 } else { 2 };
+                    let mut x = x0 - offset;
+                    while x < x0 + w {
+                        // Curved scallop bottom of each tile drawn as a
+                        // shadow line with a small dot of highlight.
+                        let tx = x.max(x0);
+                        let tw = (x + tile_w).min(x0 + w) - tx;
+                        if tw > 0 {
+                            // Bottom shadow line
+                            c.fill_rect(tx, y + rh - 1, tw, 1, base_d);
+                            // Subtle vertical seam between tiles
+                            if tx > x0 {
+                                c.fill_rect(tx, y, 1, rh, base_d);
+                            }
+                        }
+                        x += tile_w;
+                    }
+                    y += row_h;
+                    row_idx += 1;
+                }
+            };
+
             if horiz {
-                // Two trapezoid slopes meeting in middle row.
                 let mid = h / 2;
-                c.fill_rect(0, 0, w, mid, roof);
-                c.fill_rect(0, mid, w, h - mid, dark);
-                c.fill_rect(0, mid - 1, w, 2, [0, 0, 0, 255]);
-                // Pixel tile rows
-                let row = 3;
-                let mut y = 1;
-                while y < mid - 2 {
-                    c.fill_rect(0, y, w, 1, dark);
-                    y += row;
-                }
-                let mut y = mid + 2;
-                while y < h - 1 {
-                    c.fill_rect(0, y, w, 1, [0, 0, 0, 200]);
-                    y += row;
-                }
-                // Chimney
-                c.fill_rect(w - 8, 2, 4, 5, trim);
-                c.fill_rect(w - 8, 2, 4, 1, [0, 0, 0, 255]);
+                draw_dachówka(&mut c, 0, 0, w, mid, near, near_d);
+                draw_dachówka(&mut c, 0, mid, w, h - mid, far, far_d);
+                // Ridge cap (3 px tall) along the apex
+                c.fill_rect(0, mid - 1, w, 3, ridge);
+                c.fill_rect(0, mid - 1, w, 1, ridge_h);
+                // Eaves shadow at top + bottom
+                c.fill_rect(0, 0, w, 1, far_d);
+                c.fill_rect(0, h - 1, w, 1, far_d);
+                // Chimney + smoke wisp (top-right, on near slope)
+                let cx = w - 9;
+                let cy = 2;
+                c.fill_rect(cx, cy, 5, 6, trim);
+                c.fill_rect(cx, cy, 5, 1, ridge);
+                c.fill_rect(cx, cy + 5, 5, 1, ridge);
+                c.fill_rect(cx + 1, cy - 2, 3, 2, smoke);
+                c.fill_rect(cx + 2, cy - 4, 2, 2, smoke);
             } else {
                 let mid = w / 2;
-                c.fill_rect(0, 0, mid, h, roof);
-                c.fill_rect(mid, 0, w - mid, h, dark);
-                c.fill_rect(mid - 1, 0, 2, h, [0, 0, 0, 255]);
-                let col = 3;
-                let mut x = 1;
-                while x < mid - 2 {
-                    c.fill_rect(x, 0, 1, h, dark);
-                    x += col;
-                }
-                let mut x = mid + 2;
-                while x < w - 1 {
-                    c.fill_rect(x, 0, 1, h, [0, 0, 0, 200]);
-                    x += col;
-                }
-                c.fill_rect(2, h - 8, 5, 4, trim);
+                draw_dachówka(&mut c, 0, 0, mid, h, near, near_d);
+                draw_dachówka(&mut c, mid, 0, w - mid, h, far, far_d);
+                c.fill_rect(mid - 1, 0, 3, h, ridge);
+                c.fill_rect(mid - 1, 0, 1, h, ridge_h);
+                c.fill_rect(0, 0, 1, h, far_d);
+                c.fill_rect(w - 1, 0, 1, h, far_d);
+                let cx = 2;
+                let cy = h - 9;
+                c.fill_rect(cx, cy, 5, 6, trim);
+                c.fill_rect(cx, cy, 5, 1, ridge);
+                c.fill_rect(cx, cy + 5, 5, 1, ridge);
+                c.fill_rect(cx + 1, cy - 2, 3, 2, smoke);
+                c.fill_rect(cx + 2, cy - 4, 2, 2, smoke);
             }
         }
         RoofStyle::Flat => {
-            c.fill_rect(0, 0, w, h, roof);
-            // Parapet rim
-            c.fill_rect(0, 0, w, 2, dark);
-            c.fill_rect(0, h - 2, w, 2, dark);
-            c.fill_rect(0, 0, 2, h, dark);
-            c.fill_rect(w - 2, 0, 2, h, dark);
-            // Tar grid pattern
-            for x in (4..w - 4).step_by(8) {
-                c.fill_rect(x, 3, 1, h - 6, [0, 0, 0, 80]);
+            // Solid gravel-covered roof with raised parapet around the edge.
+            // The gravel is a stipple of three brightnesses; parapet steps
+            // down with a highlight on the inner face for depth.
+            let gravel_a = roof;
+            let gravel_b: Rgba = [
+                ((roof[0] as i32 - 14).max(0)) as u8,
+                ((roof[1] as i32 - 14).max(0)) as u8,
+                ((roof[2] as i32 - 14).max(0)) as u8,
+                255,
+            ];
+            let gravel_c: Rgba = [
+                ((roof[0] as i32 + 18).min(255)) as u8,
+                ((roof[1] as i32 + 18).min(255)) as u8,
+                ((roof[2] as i32 + 18).min(255)) as u8,
+                255,
+            ];
+            c.fill_rect(0, 0, w, h, gravel_a);
+            // Parapet (3 px wide stone wall around perimeter) + inner shadow
+            c.fill_rect(0, 0, w, 3, dark);
+            c.fill_rect(0, h - 3, w, 3, dark);
+            c.fill_rect(0, 0, 3, h, dark);
+            c.fill_rect(w - 3, 0, 3, h, dark);
+            c.fill_rect(3, 3, w - 6, 1, [0, 0, 0, 110]);
+            c.fill_rect(3, h - 4, w - 6, 1, [0, 0, 0, 110]);
+            c.fill_rect(3, 3, 1, h - 6, [0, 0, 0, 110]);
+            c.fill_rect(w - 4, 3, 1, h - 6, [0, 0, 0, 110]);
+            // Gravel stipple — deterministic checker patches so it isn't a
+            // flat slab but reads as aggregate.
+            for y in 4..h - 4 {
+                for x in 4..w - 4 {
+                    let n = (x * 73 + y * 131 + x * y) & 0xFF;
+                    if n < 30 {
+                        c.put(x, y, gravel_b);
+                    } else if n < 60 {
+                        c.put(x, y, gravel_c);
+                    }
+                }
             }
-            for y in (4..h - 4).step_by(8) {
-                c.fill_rect(3, y, w - 6, 1, [0, 0, 0, 80]);
-            }
+            // No grid lines — the gravel stipple already gives texture.
             // AC unit (if room)
             if w >= 24 && h >= 18 {
                 c.fill_rect(w / 2 - 3, h / 2 - 3, 6, 6, trim);
@@ -3445,136 +4087,238 @@ fn build_roof_image(kind: BuildingType, style: RoofStyle, w_tiles: i32, h_tiles:
             }
         }
         RoofStyle::Apt => {
-            // "Blok z wielkiej płyty" — Polish concrete-panel block.
-            // Long horizontal panel rows separated by darker seams,
-            // grid of windows, central staircase shaft, antenna +
-            // ventilation pipes on top.
-            let concrete = roof;
+            // Polish "blok" rooftop seen straight down — solid bitumen
+            // surface, raised parapet, tar seams between roof segments,
+            // central stairwell shed, antenna mast, satellite dish, HVAC
+            // box, vent pipes, drainage gutter.  Deliberately NO windows
+            // here — windows belong on the FACADE which is rendered
+            // separately by `spawn_building_windows`, not on the roof.
+            let bitumen = roof;
             let seam = dark;
-            let panel_hi: Rgba = [
-                ((roof[0] as i32 + 30).min(255)) as u8,
-                ((roof[1] as i32 + 30).min(255)) as u8,
-                ((roof[2] as i32 + 32).min(255)) as u8,
+            let bitumen_d: Rgba = [
+                ((roof[0] as i32 - 18).max(0)) as u8,
+                ((roof[1] as i32 - 18).max(0)) as u8,
+                ((roof[2] as i32 - 18).max(0)) as u8,
                 255,
             ];
-            let window_lit: Rgba = [200, 196, 152, 255];
-            let window_dim: Rgba = [60, 70, 88, 255];
-            let window_dark: Rgba = [38, 42, 52, 255];
-            c.fill_rect(0, 0, w, h, concrete);
-            // Outer outline
-            c.fill_rect(0, 0, w, 1, seam);
-            c.fill_rect(0, h - 1, w, 1, seam);
-            c.fill_rect(0, 0, 1, h, seam);
-            c.fill_rect(w - 1, 0, 1, h, seam);
-            // Horizontal panel seams every ~6 px (one per "floor")
-            let panel_step = 6;
-            let mut y = panel_step;
-            while y < h - 1 {
-                c.fill_rect(0, y, w, 1, seam);
-                if y + 1 < h - 1 {
-                    c.fill_rect(0, y + 1, w, 1, panel_hi);
+            let bitumen_h: Rgba = [
+                ((roof[0] as i32 + 18).min(255)) as u8,
+                ((roof[1] as i32 + 18).min(255)) as u8,
+                ((roof[2] as i32 + 18).min(255)) as u8,
+                255,
+            ];
+            let metal: Rgba = [110, 114, 122, 255];
+            let metal_d: Rgba = [62, 64, 70, 255];
+            let metal_h: Rgba = [180, 184, 192, 255];
+            let red_lamp: Rgba = [220, 60, 50, 255];
+            c.fill_rect(0, 0, w, h, bitumen);
+            // Stipple texture so the surface doesn't look like flat paint.
+            for y in 4..h - 4 {
+                for x in 4..w - 4 {
+                    let n = (x * 53 + y * 97 + x * y) & 0xFF;
+                    if n < 32 {
+                        c.put(x, y, bitumen_d);
+                    } else if n < 56 {
+                        c.put(x, y, bitumen_h);
+                    }
                 }
-                y += panel_step;
             }
-            // Vertical panel joints every ~10 px
-            let joint_step = 10;
-            let mut x = joint_step;
-            while x < w - 1 {
-                c.fill_rect(x, 1, 1, h - 2, seam);
-                x += joint_step;
+            // Parapet wall — 3 px tall, thicker at the top edges so it
+            // reads as a wall rather than a stripe.
+            c.fill_rect(0, 0, w, 3, dark);
+            c.fill_rect(0, h - 3, w, 3, dark);
+            c.fill_rect(0, 0, 3, h, dark);
+            c.fill_rect(w - 3, 0, 3, h, dark);
+            c.fill_rect(3, 3, w - 6, 1, [0, 0, 0, 130]);
+            c.fill_rect(3, h - 4, w - 6, 1, [0, 0, 0, 130]);
+            c.fill_rect(3, 3, 1, h - 6, [0, 0, 0, 130]);
+            c.fill_rect(w - 4, 3, 1, h - 6, [0, 0, 0, 130]);
+            // Tar seams — three horizontal stripes splitting the surface
+            // into roofing-felt strips.  Single colour, no panel highlight.
+            let seam_step = ((h - 6) / 4).max(8);
+            let mut sy = 4 + seam_step;
+            while sy < h - 4 {
+                c.fill_rect(4, sy, w - 8, 1, seam);
+                sy += seam_step;
             }
-            // Window grid — small 2×2 squares, alternate lit/dim per
-            // floor for that "lived-in" look.
-            let mut floor_idx = 0i32;
-            let mut row_y = 2;
-            while row_y < h - 4 {
-                let mut col_x = 3;
-                let mut win_idx = 0i32;
-                while col_x < w - 3 {
-                    let lit = (floor_idx + win_idx).rem_euclid(3) == 0;
-                    let dim = (floor_idx + win_idx * 2).rem_euclid(5) == 0;
-                    let col = if lit {
-                        window_lit
-                    } else if dim {
-                        window_dim
-                    } else {
-                        window_dark
-                    };
-                    c.fill_rect(col_x, row_y, 4, 2, col);
-                    c.put(col_x, row_y, seam);
-                    col_x += 6;
-                    win_idx += 1;
-                }
-                floor_idx += 1;
-                row_y += panel_step;
-            }
-            // Central staircase shaft on the roof — a small dark box
-            // marking where the stairwell exits.
-            if w >= 16 && h >= 12 {
+            // Central stairwell shed (raised box with a pitched cover).
+            if w >= 18 && h >= 14 {
                 let cx = w / 2;
                 let cy = h / 2;
-                c.fill_rect(cx - 4, cy - 3, 8, 6, [56, 60, 70, 255]);
-                c.fill_rect(cx - 4, cy - 3, 8, 1, seam);
-                c.fill_rect(cx - 4, cy + 2, 8, 1, seam);
-                c.put(cx - 1, cy, [200, 200, 210, 255]);
+                c.fill_rect(cx - 5, cy - 4, 10, 9, metal);
+                c.fill_rect(cx - 5, cy - 4, 10, 1, metal_h);
+                c.fill_rect(cx - 5, cy + 4, 10, 1, metal_d);
+                c.fill_rect(cx - 5, cy - 4, 1, 9, metal_d);
+                c.fill_rect(cx + 4, cy - 4, 1, 9, metal_d);
+                // Door on the south face
+                c.fill_rect(cx - 1, cy + 1, 3, 4, [40, 42, 50, 255]);
+                c.put(cx + 1, cy + 3, [220, 188, 70, 255]);
             }
-            // Antenna sticking out of the roof.
+            // HVAC unit (top-left quadrant)
+            let hx = 6;
+            let hy = 6;
+            if w > hx + 10 && h > hy + 8 {
+                c.fill_rect(hx, hy, 9, 6, metal);
+                c.fill_rect(hx, hy, 9, 1, metal_h);
+                c.fill_rect(hx, hy + 5, 9, 1, metal_d);
+                // Fan grille
+                for fx in 0..3 {
+                    c.fill_rect(hx + 1 + fx * 3, hy + 2, 1, 3, metal_d);
+                }
+            }
+            // Satellite dish (bottom-right)
+            let dx = w - 11;
+            let dy = h - 11;
+            if dx > 4 && dy > 4 {
+                for ay in 0..7 {
+                    for ax in 0..7 {
+                        let ddx = ax - 3;
+                        let ddy = ay - 3;
+                        if ddx * ddx + ddy * ddy <= 9 {
+                            c.put(dx + ax, dy + ay, metal);
+                        }
+                    }
+                }
+                c.put(dx + 3, dy + 3, metal_h);
+                c.fill_rect(dx + 4, dy + 4, 1, 4, metal_d);
+            }
+            // Antenna mast with red warning light at the top.
             let ax = w * 3 / 4;
-            let ay = 2;
-            c.fill_rect(ax, ay, 1, 5, [40, 42, 48, 255]);
-            c.put(ax - 1, ay, [40, 42, 48, 255]);
-            c.put(ax + 1, ay, [40, 42, 48, 255]);
-            c.put(ax, ay + 6, [200, 50, 50, 255]);
-            // HVAC vent pipes
-            let vx = w / 4;
-            let vy = h / 4;
-            c.fill_rect(vx, vy, 4, 4, [98, 100, 108, 255]);
-            c.fill_rect(vx, vy, 4, 1, seam);
-            c.put(vx + 1, vy + 1, [180, 184, 192, 255]);
+            let ay = 5;
+            if ax > 4 && ax < w - 4 {
+                c.fill_rect(ax, ay, 1, 8, metal_d);
+                // Brace
+                c.put(ax - 1, ay + 4, metal_d);
+                c.put(ax + 1, ay + 4, metal_d);
+                // Red warning lamp
+                c.fill_rect(ax - 1, ay - 2, 3, 2, red_lamp);
+                c.put(ax, ay - 3, red_lamp);
+            }
+            // Vent stacks (two short pipes lower-left)
+            for vi in 0..2 {
+                let vx = 5 + vi * 4;
+                let vy = h - 9;
+                if vy > 4 {
+                    c.fill_rect(vx, vy, 3, 4, metal);
+                    c.fill_rect(vx, vy, 3, 1, metal_h);
+                    c.fill_rect(vx + 1, vy - 1, 1, 1, metal_d);
+                }
+            }
+            // Drainage scupper near the bottom-right parapet
+            if w >= 24 {
+                c.fill_rect(w - 9, h - 4, 5, 1, [0, 0, 0, 180]);
+            }
         }
         RoofStyle::Saw => {
-            // Alternating dark/light strips
-            let strip = 4;
+            // Sawtooth factory roof: one slanted face (light) plus a near-
+            // vertical glazed face per tooth, repeated across the long
+            // dimension.  Each glazed face is a recessed strip of skylights
+            // — clearly part of the roof surface, not "looking through" it.
+            let face = roof;
+            let face_d: Rgba = [
+                ((roof[0] as i32 - 22).max(0)) as u8,
+                ((roof[1] as i32 - 22).max(0)) as u8,
+                ((roof[2] as i32 - 22).max(0)) as u8,
+                255,
+            ];
+            let glass: Rgba = [120, 140, 160, 255];
+            let glass_d: Rgba = [60, 70, 84, 255];
+            let frame: Rgba = [54, 56, 62, 255];
+            let tooth = 6;
             let mut y = 0;
             let mut alt = false;
             while y < h {
-                let band_h = strip.min(h - y);
-                let col = if alt { roof } else { dark };
-                c.fill_rect(0, y, w, band_h, col);
+                let band_h = tooth.min(h - y);
                 if alt {
-                    // Skylight slits
-                    for x in (3..w - 3).step_by(8) {
-                        c.fill_rect(x, y + 1, 2, 1, [200, 220, 240, 255]);
+                    // Glazed (recessed) face
+                    c.fill_rect(0, y, w, band_h, frame);
+                    c.fill_rect(0, y + 1, w, band_h.saturating_sub(2), glass_d);
+                    // Mullions every 6 px
+                    let mut x = 0;
+                    while x < w {
+                        c.fill_rect(x, y, 1, band_h, frame);
+                        if x + 1 < w {
+                            c.fill_rect(x + 1, y + 1, 1, band_h.saturating_sub(2), glass);
+                        }
+                        x += 6;
                     }
+                } else {
+                    c.fill_rect(0, y, w, band_h, face);
+                    c.fill_rect(0, y, w, 1, face_d);
+                    c.fill_rect(0, y + band_h - 1, w, 1, face_d);
                 }
-                y += strip;
+                y += tooth;
                 alt = !alt;
             }
-            // Chimney stacks
-            c.fill_rect(w - 8, 2, 3, 6, trim);
-            c.fill_rect(w - 14, 2, 3, 6, trim);
+            // Outer parapet
+            c.fill_rect(0, 0, w, 1, dark);
+            c.fill_rect(0, h - 1, w, 1, dark);
+            c.fill_rect(0, 0, 1, h, dark);
+            c.fill_rect(w - 1, 0, 1, h, dark);
+            // Two industrial chimney stacks (top-right area)
+            c.fill_rect(w - 9, 2, 3, 7, trim);
+            c.fill_rect(w - 9, 2, 3, 1, dark);
+            c.fill_rect(w - 14, 2, 3, 7, trim);
+            c.fill_rect(w - 14, 2, 3, 1, dark);
         }
         RoofStyle::Round => {
-            c.fill_rect(0, 0, w, h, [0, 0, 0, 0]);
-            // Ellipse fill
+            // Cylindrical tank — solid dome with rivet ring, stenciled
+            // hatch in the middle, ladder rungs on one side.
             let cx = w / 2;
             let cy = h / 2;
             let rx = w / 2 - 1;
             let ry = h / 2 - 1;
+            let body_d: Rgba = [
+                ((roof[0] as f32 * 0.6) as u8),
+                ((roof[1] as f32 * 0.6) as u8),
+                ((roof[2] as f32 * 0.6) as u8),
+                255,
+            ];
+            let body_h: Rgba = [
+                ((roof[0] as i32 + 30).min(255)) as u8,
+                ((roof[1] as i32 + 30).min(255)) as u8,
+                ((roof[2] as i32 + 30).min(255)) as u8,
+                255,
+            ];
+            let rivet = [60, 60, 64, 255];
             for y in 0..h {
                 for x in 0..w {
-                    let dx = (x - cx) as f32 / rx as f32;
-                    let dy = (y - cy) as f32 / ry as f32;
-                    if dx * dx + dy * dy <= 1.0 {
-                        c.put(x, y, roof);
+                    let ddx = (x - cx) as f32 / rx.max(1) as f32;
+                    let ddy = (y - cy) as f32 / ry.max(1) as f32;
+                    let r2 = ddx * ddx + ddy * ddy;
+                    if r2 <= 1.0 {
+                        // Shading: top-left highlight, bottom-right shadow.
+                        let shade = ddx + ddy;
+                        let col = if shade < -0.7 {
+                            body_h
+                        } else if shade > 0.7 {
+                            body_d
+                        } else {
+                            roof
+                        };
+                        c.put(x, y, col);
                     }
                 }
             }
-            // Inner highlight
-            c.fill_rect(cx - rx / 2, cy - 1, rx, 2, [200, 200, 200, 255]);
+            // Rivet ring just inside the rim
+            for theta in (0..360).step_by(15) {
+                let a = (theta as f32).to_radians();
+                let px = cx as f32 + a.cos() * (rx as f32 - 2.0);
+                let py = cy as f32 + a.sin() * (ry as f32 - 2.0);
+                c.put(px as i32, py as i32, rivet);
+            }
+            // Hatch in the middle
+            c.fill_rect(cx - 3, cy - 2, 6, 4, body_d);
+            c.fill_rect(cx - 3, cy - 2, 6, 1, dark);
+            c.fill_rect(cx - 3, cy + 1, 6, 1, dark);
+            c.put(cx + 1, cy, rivet);
+            // Ladder rungs along the right
+            for r in 0..4 {
+                c.fill_rect(cx + rx - 5, cy - 4 + r * 3, 4, 1, dark);
+            }
         }
         RoofStyle::Tent => {
-            // Pyramid: two triangles dark/light
+            // Pyramidal canvas: two triangles dark/light split by a ridge.
             let cx = w / 2;
             let cy = h / 2;
             for y in 0..h {
@@ -4466,4 +5210,110 @@ fn build_flag() -> Image {
     c.fill_rect(17, 4, 12, 1, [88, 24, 18, 255]);
     c.fill_rect(17, 11, 12, 1, [88, 24, 18, 255]);
     c.into_image()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Internal-only test helper — `bfs_distance_field_bounded` isn't part
+    // of the public `crate::map` re-export surface, so we reach into the
+    // sibling module directly.
+    use crate::map_nav::bfs_distance_field_bounded;
+
+    #[test]
+    fn obstacle_grid_finds_circle_inside_one_cell() {
+        let mut o = MapObstacles::default();
+        o.list.push(Obstacle {
+            pos: Vec2::new(100.0, 100.0),
+            shape: ObstacleShape::Circle(20.0),
+        });
+        o.rebuild_grid();
+        assert!(o.hits(Vec2::new(105.0, 100.0), 5.0));
+        assert!(!o.hits(Vec2::new(500.0, 500.0), 5.0));
+    }
+
+    #[test]
+    fn obstacle_grid_handles_circle_spanning_cells() {
+        let mut o = MapObstacles::default();
+        o.list.push(Obstacle {
+            pos: Vec2::ZERO,
+            shape: ObstacleShape::Circle(300.0),
+        });
+        o.rebuild_grid();
+        assert!(o.hits(Vec2::new(250.0, 0.0), 10.0));
+        assert!(!o.hits(Vec2::new(320.0, 0.0), 5.0));
+    }
+
+    #[test]
+    fn obstacle_grid_resolve_pushes_circle_out() {
+        let mut o = MapObstacles::default();
+        o.list.push(Obstacle {
+            pos: Vec2::ZERO,
+            shape: ObstacleShape::Circle(20.0),
+        });
+        o.rebuild_grid();
+        let mut p = Vec2::new(15.0, 0.0);
+        o.resolve(&mut p, 5.0);
+        assert!(p.length() >= 24.9, "resolved pos length {} < 25", p.length());
+    }
+
+    #[test]
+    fn obstacle_grid_skips_zero_radius_circles() {
+        let mut o = MapObstacles::default();
+        o.list.push(Obstacle {
+            pos: Vec2::ZERO,
+            shape: ObstacleShape::Circle(0.0),
+        });
+        o.rebuild_grid();
+        assert!(!o.hits(Vec2::ZERO, 5.0));
+    }
+
+    #[test]
+    fn bfs_distance_field_zero_at_start() {
+        let total = (MAP_COLS * MAP_ROWS) as usize;
+        let walkable = vec![true; total];
+        let dist = bfs_distance_field_bounded(&walkable, Vec2::ZERO, 5);
+        let (sc, sr) = world_to_tile(Vec2::ZERO);
+        assert_eq!(dist[nav_idx(sc, sr)], 0);
+    }
+
+    #[test]
+    fn bfs_distance_field_respects_walls() {
+        let total = (MAP_COLS * MAP_ROWS) as usize;
+        let mut walkable = vec![true; total];
+        // Wall everything in row 23 — BFS from below shouldn't reach row 24+.
+        for c in 0..MAP_COLS {
+            walkable[nav_idx(c, 23)] = false;
+        }
+        let start = tile_center(120, 0);
+        let dist = bfs_distance_field_bounded(&walkable, start, 100);
+        assert_eq!(dist[nav_idx(120, 0)], 0);
+        assert_ne!(dist[nav_idx(120, 22)], u16::MAX);
+        assert_eq!(dist[nav_idx(120, 24)], u16::MAX);
+    }
+
+    #[test]
+    fn bfs_distance_field_bounded_caps_distance() {
+        let total = (MAP_COLS * MAP_ROWS) as usize;
+        let walkable = vec![true; total];
+        let start = tile_center(120, 24);
+        let dist = bfs_distance_field_bounded(&walkable, start, 5);
+        let (c, r) = world_to_tile(start);
+        // Tile 7 away should NOT be reached (max_dist=5).
+        assert_eq!(dist[nav_idx(c + 7, r)], u16::MAX);
+        // Tile within radius is reached.
+        assert_ne!(dist[nav_idx(c + 3, r)], u16::MAX);
+    }
+
+    #[test]
+    fn nav_idx_in_bounds_round_trip() {
+        for col in [0, 1, MAP_COLS / 2, MAP_COLS - 1] {
+            for row in [0, MAP_ROWS / 2, MAP_ROWS - 1] {
+                assert!(in_bounds(col, row));
+                let _ = nav_idx(col, row);
+            }
+        }
+        assert!(!in_bounds(-1, 0));
+        assert!(!in_bounds(0, MAP_ROWS));
+    }
 }

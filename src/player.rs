@@ -2,13 +2,14 @@ use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use rand::Rng;
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use crate::audio::SfxEvent;
 use crate::bullet::{spawn_walking_dust, BulletAssets, ShootEvent, ThrowEvent};
-use crate::map::{MapObstacles, MAP_HEIGHT, MAP_WIDTH, PLAYER_SPAWN_X, PLAYER_SPAWN_Y};
+use crate::map::{MapObstacles, MAP_WIDTH, PLAYER_SPAWN_X, PLAYER_SPAWN_Y};
 use crate::net::{
-    is_authoritative, is_net_client, LocalInput, NetContext, NetEntities, NetMode, RemoteInputs,
+    is_authoritative, is_net_client, LocalInput, NetContext, NetEntities, NetInput, NetMode,
+    RemoteInputs,
 };
 use crate::pixelart::{Canvas, Rgba};
 use crate::weapon::{ThrowableKind, Weapon};
@@ -68,6 +69,9 @@ pub struct Player {
     // Money multiplier (1x by default; 2x/3x while multiplier_timer > 0)
     pub money_mult: u8,
     pub money_mult_timer: f32,
+    /// Highest input sequence number the host has applied to this player's
+    /// simulation tick.  Echoed in `NetPlayerState.last_processed_seq`.
+    pub last_processed_seq: u32,
 }
 
 /// Max armor pool is the same as max HP, so a fully-armored player has
@@ -96,16 +100,88 @@ pub struct PlayerDamagedEvent {
 }
 
 /// Fired the moment a player runs out of HP — listeners drop blood pools,
-/// flash the screen, etc.  Position is the death location in world coords.
+/// spawn the death-animation corpse, flash the screen, etc.  Position is
+/// the death location in world coords; `aim_rot` is the player rotation
+/// at the moment of death so the corpse keeps the right facing.
 #[derive(Event)]
 pub struct PlayerDiedEvent {
-    #[allow(dead_code)] // Will gate per-player effects in future MP work.
     pub player_id: u8,
     pub pos: Vec2,
+    /// Player rotation (radians) at the time of death — fed into the corpse
+    /// sprite so the body faces the same way as the player did.
+    pub aim_rot: f32,
 }
+
+/// Marker component for the short-lived death-animation corpse.  Plays a
+/// brief tween (rotate, settle, fade) and despawns when `age >= lifetime`.
+/// In multiplayer the corpse is also a revive target — a teammate holding
+/// E nearby fills `revive_progress`; once `>= REVIVE_DURATION_SECS` the
+/// authoritative system respawns the dead player at the corpse position.
+#[derive(Component)]
+pub struct PlayerDeathCorpse {
+    pub age: f32,
+    pub lifetime: f32,
+    /// Direction (-1.0 or 1.0) the corpse tilts as it falls — randomised
+    /// per spawn so consecutive deaths don't all fall the same way.
+    pub fall_dir: f32,
+    /// Initial sprite rotation captured at spawn time.
+    pub start_rot: f32,
+    /// Player id of the body — used to despawn the right corpse when the
+    /// player respawns and to gate self-revive.
+    pub player_id: u8,
+    /// Seconds of revive-hold accumulated by nearby teammates.  Reset on
+    /// the host every tick where no one is reviving so dropped E presses
+    /// don't accidentally complete the revive.
+    pub revive_progress: f32,
+}
+
+/// How long a corpse hangs around so teammates can reach it.  Bumped from
+/// the original 4 s to give MP time to walk over and revive.
+const PLAYER_CORPSE_LIFETIME: f32 = 20.0;
+/// Hold-E duration (seconds) needed to revive a downed teammate.
+pub const REVIVE_DURATION_SECS: f32 = 3.0;
+/// Max distance (px) between an alive player and a corpse for revival.
+pub const REVIVE_RADIUS: f32 = 56.0;
+/// HP value the revived player wakes up with.  Low enough that revival
+/// isn't a free reset.
+pub const REVIVE_HP: i32 = 30;
 
 #[derive(Resource, Default)]
 pub struct DeadPlayers(pub Vec<u8>);
+
+/// Ring buffer of locally-issued client inputs, indexed by sequence.  Used
+/// for client-side prediction & reconciliation: when an authoritative
+/// snapshot arrives carrying `last_processed_seq`, the client drops
+/// acknowledged inputs and replays the unacknowledged tail on top of the
+/// server position — that's how the local player's transform stays smooth
+/// even though the server is the source of truth.
+///
+/// Capped to 240 entries (≈4 s of input at 60 Hz) — anything older than
+/// that means we're sufficiently desynced that snap-to-server is fine.
+#[derive(Resource, Default)]
+pub struct InputHistory {
+    pub buffer: VecDeque<(u32, NetInput)>,
+    pub next_seq: u32,
+}
+
+impl InputHistory {
+    pub fn push(&mut self, input: &NetInput) {
+        self.buffer.push_back((input.seq, *input));
+        while self.buffer.len() > 240 {
+            self.buffer.pop_front();
+        }
+    }
+    /// Drop entries whose sequence is ≤ `acked` — they're in the past.
+    pub fn ack(&mut self, acked: u32) {
+        while let Some((seq, _)) = self.buffer.front() {
+            if *seq <= acked {
+                self.buffer.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+}
 
 /// World-space reload progress bar — always stays horizontal above the
 /// local player.  Two child sprites (background + fill) so the fill width
@@ -128,6 +204,7 @@ impl Plugin for PlayerPlugin {
         app.add_event::<PlayerDamagedEvent>()
             .add_event::<PlayerDiedEvent>()
             .init_resource::<DeadPlayers>()
+            .init_resource::<InputHistory>()
             .add_systems(Startup, setup_player_assets)
             .add_systems(OnEnter(GameState::Playing), spawn_players)
             .add_systems(OnExit(GameState::Playing), despawn_players)
@@ -137,6 +214,26 @@ impl Plugin for PlayerPlugin {
                     .run_if(in_state(GameState::Playing)),
             )
             .add_systems(OnEnter(GameState::Playing), spawn_reload_bar)
+            .add_systems(
+                Update,
+                (
+                    spawn_death_corpse,
+                    despawn_corpse_for_respawned,
+                    animate_death_corpse,
+                )
+                    .chain()
+                    .run_if(in_state(GameState::Playing)),
+            )
+            .add_systems(
+                FixedUpdate,
+                revive_progress_system
+                    .run_if(gameplay_active)
+                    .run_if(is_authoritative),
+            )
+            .add_systems(
+                OnExit(GameState::Playing),
+                despawn_death_corpses,
+            )
             // Render-time interpolation: restore canonical Transform before
             // the FixedUpdate sim (so it doesn't read a lerped value),
             // snapshot the post-sim position after, and lerp in Update.
@@ -338,6 +435,18 @@ pub fn spawn_player_entity(
     id: u8,
     pos: Vec2,
 ) -> Entity {
+    spawn_player_entity_with_hp(commands, assets, id, pos, PLAYER_MAX_HP)
+}
+
+/// Variant used by the revive system to spawn a player at less than full
+/// HP — keeps revival meaningful (you don't get a free reset to 100/100).
+pub fn spawn_player_entity_with_hp(
+    commands: &mut Commands,
+    assets: &PlayerAssets,
+    id: u8,
+    pos: Vec2,
+    hp: i32,
+) -> Entity {
     commands
         .spawn((
             SpriteBundle {
@@ -351,7 +460,7 @@ pub fn spawn_player_entity(
             },
             Player {
                 id,
-                hp: PLAYER_MAX_HP,
+                hp,
                 armor: 0,
                 fire_cooldown: 0.0,
                 invuln_timer: 0.0,
@@ -366,6 +475,7 @@ pub fn spawn_player_entity(
                 throw_cooldown: 0.0,
                 money_mult: 1,
                 money_mult_timer: 0.0,
+                last_processed_seq: 0,
             },
         ))
         .id()
@@ -564,8 +674,22 @@ fn gather_local_input(
     cameras: Query<(&Camera, &GlobalTransform)>,
     players: Query<(&Transform, &Player)>,
     ctx: Res<NetContext>,
+    chat: Res<crate::chat::ChatInputState>,
     mut local: ResMut<LocalInput>,
 ) {
+    // Block player controls while the chat box is open — letters typed for
+    // a message must not also drive movement / weapon switching.  Aim still
+    // tracks the cursor so the player isn't disoriented when they close.
+    if chat.open {
+        local.0.move_x = 0.0;
+        local.0.move_y = 0.0;
+        local.0.shoot = false;
+        local.0.throw = false;
+        local.0.reload = false;
+        local.0.interact = false;
+        local.0.switch_slot = 0;
+        return;
+    }
     let mut mv = Vec2::ZERO;
     if keys.pressed(KeyCode::KeyW) || keys.pressed(KeyCode::ArrowUp) {
         mv.y += 1.0;
@@ -592,6 +716,9 @@ fn gather_local_input(
     if keys.just_pressed(KeyCode::KeyE) {
         local.0.interact = true;
     }
+    // Hold variant for revive / manhole channels — replaces every tick so a
+    // released key cleanly stops the progress accumulator.
+    local.0.interact_held = keys.pressed(KeyCode::KeyE);
 
     // Slot switching (sticky: only set, never clear — FixedUpdate may run less often than Update)
     if keys.just_pressed(KeyCode::Digit1) {
@@ -629,6 +756,85 @@ fn gather_local_input(
     }
 }
 
+/// One step of client-side prediction: applies a single `NetInput` to a
+/// local player's transform & component state.  Mirrors the relevant subset
+/// of `server_player_tick` so that the replay produced by reconciliation
+/// matches the server's authoritative simulation.
+///
+/// Used both by `client_local_predict` (current input) and by
+/// `client_apply_snapshots` (replaying unacknowledged history on top of the
+/// server's authoritative pose).  Keeping the logic in one place is what
+/// makes prediction stable — divergence between predict and replay would
+/// produce visible jitter on every snapshot.
+/// Two-zone Y clamp: surface map OR metro level, with the void between
+/// them strictly forbidden.  Anything that lands in the void zone (e.g.
+/// a buggy collide-resolve push) is snapped to whichever side it's
+/// closer to.  The teleport system bypasses this by setting positions
+/// inside one of the legal zones, so legitimate descents work.
+#[inline]
+fn clamp_player_y(y: f32) -> f32 {
+    let half = crate::map::MAP_HEIGHT * 0.5;
+    let surface_top = half - PLAYER_RADIUS;
+    let surface_bot = -half + PLAYER_RADIUS;
+    let metro_top = crate::underground::UNDER_TOP - PLAYER_RADIUS;
+    let metro_bot = crate::underground::UNDER_BOTTOM + PLAYER_RADIUS;
+    // Threshold roughly halfway between the two legal zones — anything
+    // above this snaps into the surface, anything below into the metro.
+    let split = (-half + crate::underground::UNDER_TOP) * 0.5;
+    if y > split {
+        y.clamp(surface_bot, surface_top)
+    } else {
+        y.clamp(metro_bot, metro_top)
+    }
+}
+
+pub fn apply_input_to_local(
+    transform: &mut Transform,
+    player: &mut Player,
+    input: &NetInput,
+    obstacles: &MapObstacles,
+    dt: f32,
+) {
+    let mv = Vec2::new(input.move_x, input.move_y).normalize_or_zero();
+    if mv != Vec2::ZERO {
+        transform.translation += (mv * PLAYER_SPEED * dt).extend(0.0);
+    }
+    let half_w = crate::map::MAP_WIDTH / 2.0 - PLAYER_RADIUS;
+    transform.translation.x = transform.translation.x.clamp(-half_w, half_w);
+    transform.translation.y = clamp_player_y(transform.translation.y);
+
+    let mut pos = transform.translation.truncate();
+    obstacles.resolve(&mut pos, PLAYER_RADIUS);
+    transform.translation.x = pos.x.clamp(-half_w, half_w);
+    transform.translation.y = clamp_player_y(pos.y);
+
+    let aim = Vec2::new(input.aim_x, input.aim_y);
+    if aim.length_squared() > 0.0001 {
+        let aim = aim.normalize();
+        player.aim = aim;
+        transform.rotation = Quat::from_rotation_z(aim.y.atan2(aim.x));
+    }
+
+    match input.switch_slot {
+        1 => {
+            if player.active_slot != 0 {
+                player.active_slot = 0;
+            }
+        }
+        2 => {
+            if player.slots[1].is_some() && player.active_slot != 1 {
+                player.active_slot = 1;
+            }
+        }
+        3 => {
+            if player.throwable_count > 0 && player.active_slot != 2 {
+                player.active_slot = 2;
+            }
+        }
+        _ => {}
+    }
+}
+
 fn client_local_predict(
     time: Res<Time>,
     local: Res<LocalInput>,
@@ -641,48 +847,7 @@ fn client_local_predict(
         if player.id != ctx.my_id {
             continue;
         }
-        // Movement prediction
-        let mv = Vec2::new(local.0.move_x, local.0.move_y).normalize_or_zero();
-        if mv != Vec2::ZERO {
-            transform.translation += (mv * PLAYER_SPEED * dt).extend(0.0);
-        }
-        let half_w = MAP_WIDTH / 2.0 - PLAYER_RADIUS;
-        let half_h = MAP_HEIGHT / 2.0 - PLAYER_RADIUS;
-        transform.translation.x = transform.translation.x.clamp(-half_w, half_w);
-        transform.translation.y = transform.translation.y.clamp(-half_h, half_h);
-
-        let mut pos = transform.translation.truncate();
-        obstacles.resolve(&mut pos, PLAYER_RADIUS);
-        transform.translation.x = pos.x.clamp(-half_w, half_w);
-        transform.translation.y = pos.y.clamp(-half_h, half_h);
-
-        // Aim rotation
-        let aim = Vec2::new(local.0.aim_x, local.0.aim_y);
-        if aim.length_squared() > 0.0001 {
-            let aim = aim.normalize();
-            player.aim = aim;
-            transform.rotation = Quat::from_rotation_z(aim.y.atan2(aim.x));
-        }
-
-        // Slot switching (local instant feedback)
-        match local.0.switch_slot {
-            1 => {
-                if player.active_slot != 0 {
-                    player.active_slot = 0;
-                }
-            }
-            2 => {
-                if player.slots[1].is_some() && player.active_slot != 1 {
-                    player.active_slot = 1;
-                }
-            }
-            3 => {
-                if player.throwable_count > 0 && player.active_slot != 2 {
-                    player.active_slot = 2;
-                }
-            }
-            _ => {}
-        }
+        apply_input_to_local(&mut transform, &mut player, &local.0, &obstacles, dt);
     }
 }
 
@@ -705,6 +870,11 @@ fn server_player_tick(
         } else {
             remote.0.get(&player.id).copied().unwrap_or_default()
         };
+        // Track which client input we just applied so we can echo it in the
+        // next snapshot for ack-based reconciliation.
+        if input.seq != 0 {
+            player.last_processed_seq = input.seq;
+        }
 
         let mv = Vec2::new(input.move_x, input.move_y);
         let mv = if mv.length_squared() > 1.0 {
@@ -716,14 +886,13 @@ fn server_player_tick(
             transform.translation += (mv * PLAYER_SPEED * dt).extend(0.0);
         }
         let half_w = MAP_WIDTH / 2.0 - PLAYER_RADIUS;
-        let half_h = MAP_HEIGHT / 2.0 - PLAYER_RADIUS;
         transform.translation.x = transform.translation.x.clamp(-half_w, half_w);
-        transform.translation.y = transform.translation.y.clamp(-half_h, half_h);
+        transform.translation.y = clamp_player_y(transform.translation.y);
 
         let mut pos = transform.translation.truncate();
         obstacles.resolve(&mut pos, PLAYER_RADIUS);
         transform.translation.x = pos.x.clamp(-half_w, half_w);
-        transform.translation.y = pos.y.clamp(-half_h, half_h);
+        transform.translation.y = clamp_player_y(pos.y);
 
         let aim = Vec2::new(input.aim_x, input.aim_y);
         let aim = if aim.length_squared() > 0.0001 {
@@ -871,6 +1040,7 @@ fn server_player_tick(
                     is_rocket,
                     homing,
                     is_flame,
+                    shooter_id: player.id,
                 });
             }
             // Consume ammo
@@ -933,6 +1103,7 @@ fn player_damage_handler(
             died_evw.send(PlayerDiedEvent {
                 player_id: player.id,
                 pos: t.translation.truncate(),
+                aim_rot: player.aim.y.atan2(player.aim.x),
             });
             commands.entity(entity).despawn_recursive();
             net_entities.players.remove(&player.id);
@@ -948,5 +1119,194 @@ fn player_damage_handler(
         .count();
     if survivors == 0 {
         next_state.set(GameState::GameOver);
+    }
+}
+
+/// Listens for `PlayerDiedEvent` and spawns a tweened corpse sprite at the
+/// death location.  The corpse uses the same per-player palette image as
+/// the live player so the body matches the player's colour.
+fn spawn_death_corpse(
+    mut commands: Commands,
+    mut events: EventReader<PlayerDiedEvent>,
+    assets: Res<PlayerAssets>,
+    existing: Query<(Entity, &PlayerDeathCorpse)>,
+) {
+    if events.is_empty() {
+        return;
+    }
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    for ev in events.read() {
+        // If a corpse already exists for this player (host raised the event
+        // locally and the snapshot path will raise it again), skip — we
+        // don't want stacked sprites.
+        if existing.iter().any(|(_, c)| c.player_id == ev.player_id) {
+            continue;
+        }
+        let palette_idx = (ev.player_id as usize) % assets.images.len();
+        let fall_dir = if rng.gen_bool(0.5) { 1.0 } else { -1.0 };
+        // Slight z-jitter so two simultaneous corpses don't z-fight.
+        let z = -0.6 + rng.gen_range(-0.05..0.05);
+        commands.spawn((
+            SpriteBundle {
+                texture: assets.images[palette_idx].clone(),
+                sprite: Sprite {
+                    custom_size: Some(PLAYER_SPRITE_SIZE),
+                    color: Color::srgba(1.0, 1.0, 1.0, 1.0),
+                    ..default()
+                },
+                transform: Transform {
+                    translation: Vec3::new(ev.pos.x, ev.pos.y, z),
+                    rotation: Quat::from_rotation_z(ev.aim_rot),
+                    scale: Vec3::splat(1.0),
+                },
+                ..default()
+            },
+            PlayerDeathCorpse {
+                age: 0.0,
+                lifetime: PLAYER_CORPSE_LIFETIME,
+                fall_dir,
+                start_rot: ev.aim_rot,
+                player_id: ev.player_id,
+                revive_progress: 0.0,
+            },
+        ));
+    }
+}
+
+/// When a player respawns (either via wave-end or revival) we need to
+/// remove their leftover corpse — otherwise a body just sits next to the
+/// freshly spawned player.  Runs every frame on every client.
+fn despawn_corpse_for_respawned(
+    mut commands: Commands,
+    players: Query<&Player>,
+    corpses: Query<(Entity, &PlayerDeathCorpse)>,
+) {
+    for (entity, corpse) in corpses.iter() {
+        if players.iter().any(|p| p.id == corpse.player_id) {
+            commands.entity(entity).despawn_recursive();
+        }
+    }
+}
+
+/// Drives the corpse animation: a quick "fall over" tilt + scale squash in
+/// the first ~0.4 s, then the body holds pose for the bulk of its lifetime
+/// (so teammates have time to revive it), and finally fades out.
+fn animate_death_corpse(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut q: Query<(Entity, &mut PlayerDeathCorpse, &mut Transform, &mut Sprite)>,
+) {
+    let dt = time.delta_seconds();
+    for (e, mut corpse, mut t, mut sprite) in q.iter_mut() {
+        corpse.age += dt;
+        if corpse.age >= corpse.lifetime {
+            commands.entity(e).despawn_recursive();
+            continue;
+        }
+        let lifetime = corpse.lifetime;
+        // Phase 1 (0..0.4 s): the body tips over with an ease-out.
+        let fall_dur = 0.4_f32;
+        let fall_t = (corpse.age / fall_dur).clamp(0.0, 1.0);
+        let ease = 1.0 - (1.0 - fall_t).powi(3);
+        let target_tilt = corpse.fall_dir * std::f32::consts::FRAC_PI_2;
+        t.rotation = Quat::from_rotation_z(corpse.start_rot + target_tilt * ease);
+        let scale_x = 1.0 + 0.05 * ease;
+        let scale_y = 1.0 - 0.35 * ease;
+        t.scale = Vec3::new(scale_x, scale_y, 1.0);
+        // Phase 2 (last 1.5 s): linear alpha fade to 0.  Anything before
+        // that point holds full opacity so revivers have a clear target.
+        let fade_dur = 1.5_f32;
+        let fade_start = lifetime - fade_dur;
+        let alpha = if corpse.age <= fade_start {
+            1.0
+        } else {
+            ((lifetime - corpse.age) / fade_dur).clamp(0.0, 1.0)
+        };
+        let mut col = sprite.color.to_srgba();
+        col.alpha = alpha;
+        sprite.color = col.into();
+    }
+}
+
+fn despawn_death_corpses(mut commands: Commands, q: Query<Entity, With<PlayerDeathCorpse>>) {
+    for e in &q {
+        commands.entity(e).despawn_recursive();
+    }
+}
+
+/// Authoritative-side revive driver.  Any alive player holding E within
+/// `REVIVE_RADIUS` of a corpse fills its `revive_progress`; once the bar
+/// completes, the dead player respawns at the corpse position with
+/// `REVIVE_HP` HP.  The corpse on every other client gets removed by
+/// `despawn_corpse_for_respawned` once the snapshot reflects the live id.
+#[allow(clippy::too_many_arguments)]
+fn revive_progress_system(
+    mut commands: Commands,
+    time: Res<Time<Fixed>>,
+    ctx: Res<NetContext>,
+    local_input: Res<LocalInput>,
+    remote_inputs: Res<crate::net::RemoteInputs>,
+    assets: Res<PlayerAssets>,
+    mut dead_players: ResMut<DeadPlayers>,
+    mut net_entities: ResMut<NetEntities>,
+    alive: Query<(&Transform, &Player), Without<PlayerDeathCorpse>>,
+    mut corpses: Query<(Entity, &Transform, &mut PlayerDeathCorpse)>,
+) {
+    let dt = time.delta_seconds();
+    // For each alive player check whether they're holding E and mark the
+    // nearest corpse within radius as "being revived this tick".
+    let mut active: HashSet<Entity> = HashSet::new();
+    for (atrans, player) in alive.iter() {
+        let held = if player.id == ctx.my_id {
+            local_input.0.interact_held
+        } else {
+            remote_inputs
+                .0
+                .get(&player.id)
+                .map(|i| i.interact_held)
+                .unwrap_or(false)
+        };
+        if !held {
+            continue;
+        }
+        let ap = atrans.translation.truncate();
+        let mut best: Option<(Entity, f32)> = None;
+        let r2 = REVIVE_RADIUS * REVIVE_RADIUS;
+        for (e, ct, _) in corpses.iter() {
+            let d2 = ap.distance_squared(ct.translation.truncate());
+            if d2 <= r2 && best.map(|(_, b)| d2 < b).unwrap_or(true) {
+                best = Some((e, d2));
+            }
+        }
+        if let Some((e, _)) = best {
+            active.insert(e);
+        }
+    }
+    // Apply progress (active corpses) or decay (idle ones).
+    let mut completed: Vec<(Entity, u8, Vec2)> = Vec::new();
+    for (e, ct, mut corpse) in corpses.iter_mut() {
+        if active.contains(&e) {
+            corpse.revive_progress += dt;
+            if corpse.revive_progress >= REVIVE_DURATION_SECS {
+                completed.push((e, corpse.player_id, ct.translation.truncate()));
+            }
+        } else {
+            corpse.revive_progress = (corpse.revive_progress - dt * 1.5).max(0.0);
+        }
+    }
+    // Apply respawns.  We only respawn a player whose id is still in the
+    // dead list — guards against duplicate spawns from race conditions.
+    for (corpse_entity, id, pos) in completed {
+        let was_dead = dead_players.0.contains(&id);
+        if !was_dead {
+            commands.entity(corpse_entity).despawn_recursive();
+            continue;
+        }
+        dead_players.0.retain(|d| *d != id);
+        let ent = spawn_player_entity_with_hp(&mut commands, &assets, id, pos, REVIVE_HP);
+        commands.entity(ent).insert(LogicalPos::at(pos));
+        net_entities.players.insert(id, ent);
+        commands.entity(corpse_entity).despawn_recursive();
     }
 }
