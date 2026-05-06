@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bevy = "0.14"
+# `wayland` is additive on top of the default `x11` so the same binary runs
+# natively on both Xorg and Wayland sessions instead of falling back through
+# XWayland (which broke BorderlessFullscreen + cursor on several distros).
+bevy = { version = "0.14", features = ["wayland"] }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
