@@ -11,16 +11,12 @@
 //  `map.rs::spawn_map`.
 // ════════════════════════════════════════════════════════════════════════
 
-#![allow(dead_code)]
-
 use bevy::math::IVec2;
 
 // Re-export the baked tables so `map.rs` can use them directly.
-// `ZOMBIE_SPAWNS` is currently unused — kept as future hook for pre-placed
-// ambient zombies described in the spec (count = 3 + difficulty*2 per seg).
+// (`world_consts::ZOMBIE_SPAWNS` exists for a future "pre-placed ambient
+// zombies" feature but isn't re-exported here yet.)
 pub use crate::world_consts::{BUILDINGS, PROPS, SEGMENTS};
-#[allow(unused_imports)]
-pub use crate::world_consts::ZOMBIE_SPAWNS;
 
 // ──── Segments ──────────────────────────────────────────────────────────
 
@@ -34,6 +30,9 @@ pub enum Theme {
 }
 
 #[derive(Clone, Copy, Debug)]
+/// `name` and `difficulty` are baked into world_consts but unused at
+/// runtime — kept to keep the world generator output stable.
+#[allow(dead_code)]
 pub struct Segment {
     pub id: u8,
     pub name: &'static str,
@@ -44,7 +43,11 @@ pub struct Segment {
 
 // ──── Buildings ─────────────────────────────────────────────────────────
 
+/// All building archetypes the world generator can emit.  The current
+/// `world_consts.rs` doesn't instantiate `Civic` or `Market` but they're
+/// kept so re-baking with a different seed/spec stays compatible.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum BuildingType {
     House,
     Shed,
@@ -105,7 +108,11 @@ pub struct Building {
 
 // ──── Props ─────────────────────────────────────────────────────────────
 
+/// All prop archetypes the world generator can emit.  `Car` and `Wreck`
+/// aren't used by the current bake but kept so a re-generation can use
+/// them without protocol changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum PropKind {
     // Suburb / hospital flora
     Tree,
@@ -165,7 +172,10 @@ pub struct Prop {
 
 // ──── Gates between segments ────────────────────────────────────────────
 
+/// `Tunnel` isn't currently emitted by the world generator but exists
+/// so a future `GATES` re-bake can use it without changing this enum.
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 pub enum GateKind {
     /// Old river bridge: arched span over water.
     Bridge,
@@ -184,6 +194,8 @@ pub struct Gate {
     pub kind: GateKind,
     /// Cost in dollars to unlock (= deduct from shared `Score`).
     pub cost: u32,
+    /// Human-readable name baked for future tooltip / UI use.
+    #[allow(dead_code)]
     pub label: &'static str,
 }
 
@@ -221,142 +233,6 @@ pub const GATES: &[Gate] = &[
     },
 ];
 
-// ──── Compat shims kept so other modules keep compiling ─────────────────
-// The legacy (rural-village) furniture and decor systems are no longer
-// instantiated — buildings are solid blocks in this iteration and the
-// prop system replaces street decor.  We keep the *types* here so older
-// match arms don't break across the project.
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BuildingKind {
-    House,
-    Sheriff,
-    Pharmacy,
-    Diner,
-    GeneralStore,
-    Saloon,
-    Church,
-    GasStation,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum FurnitureKind {
-    Desk,
-    OfficeChair,
-    FilingCabinet,
-    WeaponsRack,
-    JailBarsH,
-    JailBarsV,
-    Cot,
-    Toilet,
-    ShelfH,
-    ShelfV,
-    Counter,
-    Register,
-    Crate,
-    Barrel,
-    Freezer,
-    BoothW,
-    BoothE,
-    DinerTable,
-    DinerStool,
-    Stove,
-    Fridge,
-    BarCounter,
-    PoolTable,
-    Piano,
-    Pew,
-    Altar,
-    Cross,
-    Candle,
-    ToolBench,
-    OilBarrel,
-    CarLift,
-    GasPump,
-    Bed,
-    Dresser,
-    Nightstand,
-    Couch,
-    CoffeeTable,
-    Tv,
-    Sink,
-    DiningTable,
-    Rug,
-    InternalWallH,
-    InternalWallV,
-}
-
-#[derive(Clone, Copy)]
-pub struct FurnitureSpec {
-    pub kind: FurnitureKind,
-    pub dx: f32,
-    pub dy: f32,
-}
-
-pub const HOUSE_FURNITURE: &[FurnitureSpec] = &[];
-pub const SHERIFF_FURNITURE: &[FurnitureSpec] = &[];
-pub const PHARMACY_FURNITURE: &[FurnitureSpec] = &[];
-pub const DINER_FURNITURE: &[FurnitureSpec] = &[];
-pub const GENERAL_STORE_FURNITURE: &[FurnitureSpec] = &[];
-pub const SALOON_FURNITURE: &[FurnitureSpec] = &[];
-pub const CHURCH_FURNITURE: &[FurnitureSpec] = &[];
-pub const GAS_STATION_FURNITURE: &[FurnitureSpec] = &[];
-
-pub fn furniture_for(_kind: BuildingKind) -> &'static [FurnitureSpec] {
-    &[]
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum StreetDecorKind {
-    PineTree,
-    PineTreeSmall,
-    Birch,
-    DeadTree,
-    DeadTree2,
-    Bush,
-    Stump,
-    Rock,
-    GrassPatch,
-    Bus,
-    CarWreck,
-    CarWreckSedan,
-    WoodFence,
-    FencePost,
-    Mailbox,
-    Well,
-    Firepit,
-    LogPile,
-    Rubble,
-    BloodStain,
-    Crack,
-    SandbagPile,
-    Barrel,
-    Crate,
-    LampPost,
-    Bench,
-    TrashCan,
-    Dumpster,
-    FireHydrant,
-    StopSign,
-    ShopSign,
-    Tombstone,
-    TombstoneCross,
-    GasPump,
-    CemeteryGate,
-    NewspaperBox,
-    PhoneBooth,
-    BusStop,
-    Billboard,
-    RoadCone,
-    BarbedWire,
-}
-
-#[derive(Clone, Copy)]
-pub struct DecorSpec {
-    pub kind: StreetDecorKind,
-    pub x: f32,
-    pub y: f32,
-    pub rot: f32,
-}
-
-pub const STREET_DECOR: &[DecorSpec] = &[];
+// (legacy `BuildingKind`/`FurnitureKind`/`StreetDecorKind` shims removed —
+// the village/saloon/diner content was never instantiated in the metro map
+// and nothing outside this file referenced the types.)

@@ -2,7 +2,6 @@ mod achievements;
 mod audio;
 mod bullet;
 mod chat;
-mod elevator;
 mod lobby;
 mod map;
 mod map_data;
@@ -137,7 +136,6 @@ fn main() {
             weapon::WeaponPlugin,
             wave::WavePlugin,
             zones::ZonesPlugin,
-            elevator::ElevatorPlugin,
             achievements::AchievementsPlugin,
             audio::AudioFxPlugin,
             ui::UiPlugin,

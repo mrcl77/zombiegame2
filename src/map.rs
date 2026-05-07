@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::sync::OnceLock;
 
 use bevy::prelude::*;
@@ -41,31 +39,9 @@ pub const INTERNAL_WALL_THICK: f32 = 8.0;
 pub const PLAYER_SPAWN_X: f32 = -MAP_WIDTH * 0.5 + 4.5 * TILE_SIZE;
 pub const PLAYER_SPAWN_Y: f32 = -MAP_HEIGHT * 0.5 + 32.5 * TILE_SIZE;
 
-// ──── Legacy multi-floor compat shims ──────────────────────────────────
-pub const N_FLOORS: usize = 1;
-pub const FLOOR_W_TILES: i32 = MAP_COLS;
-pub const FLOOR_H_TILES: i32 = MAP_ROWS;
-pub const FLOOR_PITCH_TILES: i32 = MAP_ROWS;
-pub const FLOOR_W_PX: f32 = MAP_WIDTH;
-pub const FLOOR_H_PX: f32 = MAP_HEIGHT;
-pub const FLOOR_Y_CENTER: [f32; N_FLOORS] = [0.0];
-pub const FLOOR_NAMES: [&str; N_FLOORS] = ["MAPA"];
-pub const FLOOR_PM2: usize = 0;
-pub const FLOOR_PM1: usize = 0;
-pub const FLOOR_P0: usize = 0;
-pub const FLOOR_P1: usize = 0;
-pub const ZONE_TO_FLOOR: [usize; 4] = [0, 0, 0, 0];
-pub const BARRIER_NORTH_Y: f32 = 1_000_000.0;
-pub const BARRIER_SOUTH_Y: f32 = -1_000_000.0;
-pub const BARRIER_UNDERGROUND_Y: f32 = -1_000_001.0;
-pub const ZONE0_ROW_MIN: i32 = 0;
-pub const ZONE0_ROW_MAX: i32 = MAP_ROWS - 1;
-pub const ZONE1_ROW_MIN: i32 = MAP_ROWS;
-pub const ZONE1_ROW_MAX: i32 = MAP_ROWS;
-pub const ZONE2_ROW_MIN: i32 = MAP_ROWS;
-pub const ZONE2_ROW_MAX: i32 = MAP_ROWS;
-pub const ZONE3_ROW_MIN: i32 = MAP_ROWS;
-pub const ZONE3_ROW_MAX: i32 = MAP_ROWS;
+// (Legacy multi-floor / zone / barrier compat shims removed — the metro
+// map is single-storey, all those constants were placeholders for code
+// paths that no longer exist.)
 
 // ════════════════════════════════════════════════════════════════════════
 //  Wall side / spawn points
@@ -80,6 +56,9 @@ pub enum WallSide {
 }
 
 pub struct SpawnPointSpec {
+    /// Display name for debug/dev tooling — not read at runtime, kept so
+    /// the `SPAWN_POINTS` table reads as documentation.
+    #[allow(dead_code)]
     pub label: &'static str,
     pub tile: (i32, i32),
     pub span_tiles: i32,
@@ -279,10 +258,6 @@ fn push_vertical_wall(
     }
 }
 
-pub fn ensure_walls_built() {
-    let _ = wall_rects();
-}
-
 // ════════════════════════════════════════════════════════════════════════
 //  Coordinate helpers (segment-local → world)
 // ════════════════════════════════════════════════════════════════════════
@@ -444,6 +419,40 @@ pub struct Explodable {
 #[derive(Component, Debug, Clone, Copy)]
 pub struct ExplodableObstacleIdx(pub usize);
 
+/// Set of obstacle indices for explodables that have been destroyed —
+/// used to replicate destruction across the wire.  Host pushes here on
+/// detonation; the snapshot ships the full set; clients walk it to find
+/// matching `ExplodableObstacleIdx` entities to despawn + zero locally.
+#[derive(Resource, Default)]
+pub struct DestroyedExplodables {
+    pub indices: std::collections::HashSet<u32>,
+}
+
+/// Despawn any explodable whose obstacle index appears in
+/// `DestroyedExplodables` and zero its collision rect.  Runs every
+/// `Update` but is essentially free — `is_changed` short-circuits the
+/// no-op case, and the explodable Query only enumerates surviving
+/// entities (so already-destroyed ones don't get processed twice).
+fn apply_destroyed_explodables(
+    mut commands: Commands,
+    destroyed: Res<DestroyedExplodables>,
+    explodables: Query<(Entity, &ExplodableObstacleIdx)>,
+    mut obstacles: ResMut<MapObstacles>,
+) {
+    if !destroyed.is_changed() {
+        return;
+    }
+    for (entity, idx) in explodables.iter() {
+        if !destroyed.indices.contains(&(idx.0 as u32)) {
+            continue;
+        }
+        if let Some(o) = obstacles.list.get_mut(idx.0) {
+            o.shape = ObstacleShape::Circle(0.0);
+        }
+        commands.entity(entity).despawn_recursive();
+    }
+}
+
 /// Streetlight flicker — modulates the lamp sprite color over time with a
 /// per-lamp phase so the lights don't pulse in unison.
 #[derive(Component, Debug, Clone, Copy)]
@@ -574,72 +583,10 @@ pub fn vehicle_explodable_for(kind: PropKind) -> Option<Explodable> {
     })
 }
 
-// ════════════════════════════════════════════════════════════════════════
-//  Legacy compat shims (other modules still match on these enums)
-// ════════════════════════════════════════════════════════════════════════
-
-pub struct ElevatorSpec {
-    pub pos: Vec2,
-    pub pair_idx: usize,
-    pub requires_zone: u8,
-    pub label: &'static str,
-}
-
-pub const ELEVATOR_HALF: Vec2 = Vec2::new(48.0, 44.0);
-pub const ELEVATORS: &[ElevatorSpec] = &[];
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum DoorSide {
-    South,
-    North,
-    East,
-    West,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ShopKind {
-    Fashion,
-    Electronics,
-    Coffee,
-    Books,
-    Toilets,
-    Jewelry,
-    Shoes,
-    Sports,
-    Toys,
-    Info,
-    Pharmacy,
-    Bakery,
-    Bank,
-}
-
-pub struct ShopSpec {
-    pub pos: Vec2,
-    pub half: Vec2,
-    pub door_side: DoorSide,
-    pub kind: ShopKind,
-    pub has_back_room: bool,
-}
-
-pub const SHOPS: &[ShopSpec] = &[];
-pub const SHOP_WALL_THICK: f32 = 7.0;
-pub const SHOP_DOOR_WIDTH: f32 = 48.0;
-
-pub fn shop_back_room_pos(_shop: &ShopSpec) -> Vec2 {
-    Vec2::ZERO
-}
-
-pub fn shop_wall_rects(_shop: &ShopSpec) -> Vec<(Vec2, Vec2, bool)> {
-    Vec::new()
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum MarkerKind {
-    Body,
-    Blood,
-    Food,
-    Water,
-}
+// (Legacy `ShopKind`/`ShopSpec`/`ElevatorSpec`/`DoorSide`/`MarkerKind`/
+// `SHOPS`/`ELEVATORS`/`shop_back_room_pos`/`shop_wall_rects` compat shims
+// removed — the metro map doesn't have shops or elevators, and nothing
+// outside this file ever read those types.)
 
 // ════════════════════════════════════════════════════════════════════════
 //  Segment unlock state (now: 5 segments, gates between them)
@@ -846,7 +793,14 @@ pub fn staircase_world_pos(b: &Building) -> Vec2 {
 /// Furniture types placed inside buildings.  Each spawns a sprite + an
 /// obstacle so players can navigate around them.  Reuses some of the
 /// outdoor prop kinds (Crate, Barrels) and adds new interior-only ones.
+///
+/// Several variants (KitchenSink, BathSink, CoffeeTable, FloorLamp, Rug,
+/// Painting, Trashcan, OfficeChair) have full sprite + collision support
+/// but are reserved for future room layouts — `furniture_for_floor`
+/// doesn't currently place them.  Once added there, the dead_code allow
+/// can come off.
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 pub enum FurnKind {
     Bed,
     Couch,
@@ -1141,6 +1095,7 @@ impl Plugin for MapPlugin {
             .init_resource::<PlayerFloorState>()
             .init_resource::<BuildingWallIndices>()
             .init_resource::<FloorObstacleIndices>()
+            .init_resource::<DestroyedExplodables>()
             .add_systems(Startup, spawn_map)
             .add_systems(
                 OnEnter(GameState::Playing),
@@ -1149,6 +1104,7 @@ impl Plugin for MapPlugin {
             .add_systems(
                 Update,
                 (
+                    apply_destroyed_explodables,
                     update_segment_fog_visibility,
                     refresh_segment_unlock_hint,
                     update_building_roof_visibility,

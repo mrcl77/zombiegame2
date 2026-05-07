@@ -36,19 +36,6 @@ impl Default for NavGrid {
     }
 }
 
-#[allow(dead_code)] // Kept for future "unlock-by-row" gameplay (segments).
-pub fn unlock_nav_rows(nav: &mut NavGrid, row_min: i32, row_max: i32) {
-    let rmin = row_min.max(0);
-    let rmax = row_max.min(MAP_ROWS - 1);
-    for row in rmin..=rmax {
-        for col in 0..MAP_COLS {
-            nav.walkable[(row * MAP_COLS + col) as usize] = is_walkable_tile(col, row);
-        }
-    }
-    nav.player_flow.clear();
-    nav.player_flow_tile.clear();
-}
-
 /// Maximum BFS radius (in tiles) for the per-player flow field.  60 tiles
 /// = ~1920 px ≈ 3 viewport widths.  Zombies further out fall through to the
 /// straight-line fallback in `zombie_flow_direction`, which is fine because

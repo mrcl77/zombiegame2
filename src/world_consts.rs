@@ -849,6 +849,11 @@ pub const PROPS: &[Prop] = &[
     Prop { seg_id: 5, kind: PropKind::Flag, x: 15, y: 37, w: 1, h: 1 },
 ];
 
+/// Pre-placed ambient zombie spawns (per spec: 3 + difficulty*2 per seg).
+/// Not currently consumed by any system — `map_data.rs` references them
+/// via a TODO; left in place so a future "ambient zombies" feature can
+/// just wire them up without re-baking the world.
+#[allow(dead_code)]
 pub const ZOMBIE_SPAWNS: &[(u8, IVec2)] = &[
     (1, IVec2::new(33, 9)),
     (1, IVec2::new(28, 38)),
