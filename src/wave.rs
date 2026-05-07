@@ -120,7 +120,10 @@ fn wave_system(
         state.break_timer.tick(time.delta());
         if state.break_timer.finished() {
             state.current_wave += 1;
-            let alive = players.iter().count() + dead_players.0.len();
+            // `dead_players` is drained at wave-clear (below) before the break,
+            // so it's empty here in normal flow — counting only the live query
+            // is both correct and cheaper.
+            let alive = players.iter().count();
             state.spawn_queue = build_wave_queue(state.current_wave, alive);
             state.zombies_to_spawn = state.spawn_queue.len() as u32;
             state.spawn_timer.reset();

@@ -9,7 +9,7 @@ use crate::map::{
 use crate::zones::ZoneState;
 use crate::net::{is_authoritative, NetContext, NetEntities, NetId};
 use crate::pixelart::{Canvas, Rgba};
-use crate::player::{Player, PlayerDamagedEvent, PlayerDiedEvent, PLAYER_RADIUS};
+use crate::player::{DeadPlayers, Player, PlayerDamagedEvent, PlayerDiedEvent, PLAYER_RADIUS};
 use crate::{gameplay_active, GameState};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -1520,7 +1520,7 @@ fn zombie_movement(
 fn zombie_attack(
     mut commands: Commands,
     mut zombies: Query<(Entity, &Transform, &mut Zombie), Without<Player>>,
-    players: Query<(Entity, &Transform, &Player)>,
+    players: Query<(Entity, &Transform, &Player, Option<&BurnEffect>)>,
     mut dmg: EventWriter<PlayerDamagedEvent>,
     mut explode: EventWriter<ExplodeEvent>,
     mut killed: EventWriter<ZombieKilledEvent>,
@@ -1532,7 +1532,7 @@ fn zombie_attack(
         let zp = z_t.translation.truncate();
         let zr = zombie.kind.radius();
         let mut triggered = false;
-        for (p_ent, pt, player) in &players {
+        for (p_ent, pt, player, burn) in &players {
             if player.hp <= 0 {
                 continue;
             }
@@ -1549,10 +1549,16 @@ fn zombie_attack(
                             target_id: player.id,
                             amount: zombie.kind.contact_damage(),
                         });
-                        commands.entity(p_ent).insert(BurnEffect {
-                            remaining: BURN_DURATION,
-                            accumulated: 0.0,
-                        });
+                        // Insert burn DoT only if not already burning — otherwise
+                        // continuous contact would refresh `remaining` every tick,
+                        // making the effect impossible to outlast and discarding
+                        // the partial `accumulated` damage from the prior frame.
+                        if burn.is_none() {
+                            commands.entity(p_ent).insert(BurnEffect {
+                                remaining: BURN_DURATION,
+                                accumulated: 0.0,
+                            });
+                        }
                     }
                     _ => {
                         dmg.send(PlayerDamagedEvent {
@@ -1585,14 +1591,18 @@ fn zombie_attack(
 fn burn_tick_system(
     mut commands: Commands,
     time: Res<Time>,
-    mut burn_query: Query<(Entity, &mut Player, &mut BurnEffect)>,
+    mut burn_query: Query<(Entity, &Transform, &mut Player, &mut BurnEffect)>,
     other_players: Query<&Player, Without<BurnEffect>>,
     mut net_entities: ResMut<NetEntities>,
+    mut dead_players: ResMut<DeadPlayers>,
+    mut died_evw: EventWriter<PlayerDiedEvent>,
     mut next_state: ResMut<NextState<GameState>>,
 ) {
     let dt = time.delta_seconds();
-    let mut dead_ids: Vec<u8> = Vec::new();
-    for (entity, mut player, mut burn) in &mut burn_query {
+    // Players killed in this tick — kept so we can both fire death events and
+    // exclude them when checking for game-over below.
+    let mut newly_dead: Vec<u8> = Vec::new();
+    for (entity, transform, mut player, mut burn) in &mut burn_query {
         if player.hp <= 0 {
             commands.entity(entity).remove::<BurnEffect>();
             continue;
@@ -1608,15 +1618,28 @@ fn burn_tick_system(
             commands.entity(entity).remove::<BurnEffect>();
         }
         if player.hp <= 0 {
-            dead_ids.push(player.id);
+            newly_dead.push(player.id);
+            died_evw.send(PlayerDiedEvent {
+                player_id: player.id,
+                pos: transform.translation.truncate(),
+                aim_rot: player.aim.y.atan2(player.aim.x),
+            });
             commands.entity(entity).despawn_recursive();
             net_entities.players.remove(&player.id);
+            // Track in DeadPlayers so the wave-clear respawn (and revive
+            // system) actually brings them back — without this, a burn-death
+            // permanently removes the player from the round.
+            if !dead_players.0.contains(&player.id) {
+                dead_players.0.push(player.id);
+            }
         }
     }
-    if !dead_ids.is_empty() {
+    if !newly_dead.is_empty() {
+        // Despawn is queued (not yet flushed), so the just-killed entities are
+        // still visible in `burn_query.iter()` with hp <= 0; filter them out.
         let alive = burn_query
             .iter()
-            .filter(|(_, p, _)| p.hp > 0 && !dead_ids.contains(&p.id))
+            .filter(|(_, _, p, _)| p.hp > 0 && !newly_dead.contains(&p.id))
             .count()
             + other_players.iter().filter(|p| p.hp > 0).count();
         if alive == 0 {

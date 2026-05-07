@@ -352,29 +352,11 @@ pub enum ThrowableKind {
 }
 
 impl ThrowableKind {
-    #[allow(dead_code)]
-    pub fn from_u8(v: u8) -> Self {
-        match v {
-            1 => Self::Smoke,
-            2 => Self::Molotov,
-            _ => Self::Grenade,
-        }
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Grenade => "GRENADE",
             Self::Smoke => "SMOKE",
             Self::Molotov => "MOLOTOV",
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn fuse_time(self) -> f32 {
-        match self {
-            Self::Grenade => 1.8,
-            Self::Smoke => 1.2,
-            Self::Molotov => 0.0, // explodes on contact/range
         }
     }
 
@@ -691,9 +673,8 @@ fn pick_weapon<R: Rng>(rng: &mut R, seg_id: u8) -> Weapon {
 
 /// Map a world-x coord to its segment id (1..=5).
 fn segment_for_world_x(world_x: f32) -> u8 {
-    let local_col = ((world_x + crate::map::MAP_WIDTH * 0.5) / crate::map::TILE_SIZE)
-        .floor() as i32;
-    ((local_col / crate::map::SEG_TILES) + 1).clamp(1, 5) as u8
+    let (col, _) = crate::map::world_to_tile(Vec2::new(world_x, 0.0));
+    ((col / crate::map::SEG_TILES) + 1).clamp(1, 5) as u8
 }
 
 fn pick_throwable<R: Rng>(rng: &mut R) -> ThrowableKind {
@@ -704,8 +685,20 @@ fn pick_throwable<R: Rng>(rng: &mut R) -> ThrowableKind {
     }
 }
 
+/// Per-axis pixel offset added to a tile centre when placing a pickup,
+/// so multiple pickups in the same tile don't overlap exactly.
+const PICKUP_JITTER_RADIUS: f32 = 22.0;
+/// Max tile picks before giving up — generous because the village map
+/// has lots of unwalkable tiles (forest, building interiors).
+const PICKUP_FIND_ATTEMPTS: usize = 80;
+/// Half-extent of a "near spawn" exclusion zone — pickups don't spawn
+/// here so the player isn't dropping into them on round start.
+const PICKUP_SPAWN_EXCLUSION: f32 = 70.0;
+/// Collision radius used for the obstacle hit-test when placing a pickup.
+const PICKUP_FIT_RADIUS: f32 = 18.0;
+
 fn find_pickup_spot<R: Rng>(rng: &mut R, obstacles: &MapObstacles) -> Option<Vec2> {
-    for _ in 0..80 {
+    for _ in 0..PICKUP_FIND_ATTEMPTS {
         let col = rng.gen_range(0..MAP_COLS);
         let row = rng.gen_range(0..MAP_ROWS);
         if !is_walkable_tile(col, row) {
@@ -713,13 +706,13 @@ fn find_pickup_spot<R: Rng>(rng: &mut R, obstacles: &MapObstacles) -> Option<Vec
         }
         let center = tile_center(col, row);
         let p = Vec2::new(
-            center.x + rng.gen_range(-22.0..22.0),
-            center.y + rng.gen_range(-22.0..22.0),
+            center.x + rng.gen_range(-PICKUP_JITTER_RADIUS..PICKUP_JITTER_RADIUS),
+            center.y + rng.gen_range(-PICKUP_JITTER_RADIUS..PICKUP_JITTER_RADIUS),
         );
-        if obstacles.hits(p, 18.0) {
+        if obstacles.hits(p, PICKUP_FIT_RADIUS) {
             continue;
         }
-        if p.x.abs() < 70.0 && p.y.abs() < 70.0 {
+        if p.x.abs() < PICKUP_SPAWN_EXCLUSION && p.y.abs() < PICKUP_SPAWN_EXCLUSION {
             continue;
         }
         return Some(p);
@@ -905,7 +898,10 @@ fn pickup_collection(
                 player.ammo[1] = pickup.kind.magazine_size();
                 player.reserve_ammo[1] = pickup.kind.reserve_ammo();
                 player.reload_timer = 0.0;
-                player.fire_cooldown = 0.0;
+                // Mirror the slot-switch swap delay (player.rs ~line 929) so
+                // grabbing a new weapon doesn't let the player fire on the
+                // same frame they ran over the pickup.
+                player.fire_cooldown = 0.15;
                 player.active_slot = 1;
                 if player.id == ctx.my_id {
                     local.0.interact = false;
@@ -1096,7 +1092,7 @@ fn throwable_respawn(
         return;
     };
     let kind = pick_throwable(&mut rng);
-    let num = rng.gen_range(1..=2);
+    let num = rng.gen_range(1..=3);
     let net_id = ctx.alloc_pickup_id();
     let entity = spawn_throwable_pickup_entity(&mut commands, &throwable_assets, p, kind, num, net_id);
     net_entities.pickups.insert(net_id, entity);
@@ -1231,6 +1227,9 @@ fn money_collection(
             let r = PLAYER_RADIUS + PICKUP_PICK_RADIUS;
             let d2 = pp.distance_squared(pk_t.translation.truncate());
             if d2 < r * r {
+                // Player-friendly: a weaker pickup never downgrades an active stronger
+                // buff, but it still refreshes the timer so the strong buff lasts
+                // longer. Natural expiry resets `money_mult` to 1 in `player.rs`.
                 player.money_mult = pickup.factor.max(player.money_mult);
                 player.money_mult_timer = MONEY_MULT_DURATION;
                 net_entities.pickups.remove(&net_id.0);
