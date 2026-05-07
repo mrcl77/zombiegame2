@@ -27,7 +27,7 @@ pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Network protocol version — bumped on any wire-format change.  Clients with
 /// a mismatched version are rejected at connect time so they don't trigger
 /// `bincode::deserialize` panics on a wrong-shape struct.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 7;
 
 /// Hard limit on a single chat line.  80 chars is wide enough to be useful
 /// without enabling spam.  Enforced on both the client send path and the
@@ -99,10 +99,19 @@ pub enum ServerMsg {
     Welcome { your_id: u8, protocol_version: u16 },
     LobbyState { players: Vec<u8> },
     StartGame,
+    /// Pre-start countdown — host broadcasts this when the start key is
+    /// pressed.  Clients display the remaining seconds and can prepare
+    /// themselves; `StartGame` follows when the host's local timer hits 0.
+    /// `CountdownCancel` aborts a running countdown.
+    CountdownStart { seconds: u8 },
+    CountdownCancel,
     Snapshot(Box<NetSnapshot>),
     FullLobby,
     /// Sent when a client's protocol version doesn't match the server.
     ProtocolMismatch { server_version: u16 },
+    /// Sent when a client tries to join while a round is already running.
+    /// Closes the connection — client should fall back to the menu.
+    GameInProgress,
     /// Server-relayed chat line.  Author resolved to a display name on the
     /// host (from `PlayerNicknames` / `LocalNickname`) so receivers don't
     /// need a nickname-table lookup.
@@ -210,6 +219,11 @@ pub struct NetSnapshot {
     /// connect/disconnect, so empty most of the game.  Saves ~12-40 B per
     /// snapshot once players have introduced themselves.
     pub player_nicknames: Option<Vec<(u8, String)>>,
+    /// Map-obstacle indices for explodables that have been destroyed on
+    /// the host.  Sent every snapshot (full set, not delta) so a client
+    /// joining mid-game catches up immediately.  Tiny on the wire — at
+    /// most ~30 entries × 4 B in a long match.
+    pub destroyed_explodables: Vec<u32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
@@ -235,6 +249,11 @@ pub struct NetZombieState {
     pub y: i16,
     pub rot: i16,
     pub kind: u8,
+    /// Current HP — synced so the giant's life bar (and any future
+    /// per-zombie HP overlays) read the same value on every client.
+    /// Quantised i16 fits the existing per-kind base HP comfortably
+    /// (Giant tops out at 1500 in current tuning).
+    pub hp: i16,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
@@ -287,9 +306,15 @@ pub enum ClientInEvent {
     Welcomed { your_id: u8 },
     LobbyState { players: Vec<u8> },
     Started,
+    /// Host started the pre-game countdown.  Client should mirror it for
+    /// visual feedback; the actual game start arrives as `Started`.
+    CountdownStart { seconds: u8 },
+    CountdownCancel,
     Snapshot(Box<NetSnapshot>),
     Disconnected,
     FullLobby,
+    /// Host rejected the connection because a round is already running.
+    GameInProgress,
     ProtocolMismatch {
         #[allow(dead_code)] // Surfaced for future UI display of mismatch
         server_version: u16,
@@ -302,6 +327,11 @@ pub struct HostConn {
     pub events: Arc<Mutex<Receiver<ServerEvent>>>,
     pub senders: Arc<Mutex<HashMap<u8, Sender<ServerMsg>>>>,
     pub shutdown: Arc<AtomicBool>,
+    /// Set when the round has actually started (GameState::Playing).  The
+    /// listener thread reads this on each accept to reject mid-game joiners
+    /// with `ServerMsg::GameInProgress` instead of dropping them into a live
+    /// simulation that won't spawn a player entity for them.
+    pub in_game: Arc<AtomicBool>,
 }
 
 impl Drop for HostConn {
@@ -442,12 +472,13 @@ pub fn start_host() -> std::io::Result<HostConn> {
     let senders: Arc<Mutex<HashMap<u8, Sender<ServerMsg>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let shutdown = Arc::new(AtomicBool::new(false));
+    let in_game = Arc::new(AtomicBool::new(false));
 
     let senders_clone = senders.clone();
     let event_tx_clone = event_tx.clone();
     let shutdown_clone = shutdown.clone();
+    let in_game_clone = in_game.clone();
     thread::spawn(move || {
-        let mut next_id: u8 = 1;
         loop {
             if shutdown_clone.load(Ordering::Relaxed) {
                 break;
@@ -509,8 +540,32 @@ pub fn start_host() -> std::io::Result<HostConn> {
             // Restore blocking, no-timeout reads for the steady-state stream.
             let _ = handshake_stream.set_read_timeout(None);
 
-            let id = next_id;
-            next_id = next_id.wrapping_add(1);
+            // Reject mid-round joiners cleanly.  Without this the host would
+            // accept the connection but never spawn a Player entity for them
+            // (sync.rs::server_receive_inputs only logs `Connected` mid-game),
+            // leaving the client wedged in a broken state.
+            if in_game_clone.load(Ordering::Relaxed) {
+                let _ = write_msg(&mut handshake_stream, &ServerMsg::GameInProgress);
+                let _ = handshake_stream.shutdown(std::net::Shutdown::Both);
+                continue;
+            }
+
+            // Allocate the lowest free id in 1..u8::MAX that isn't already
+            // in `senders`.  Skipping in-use ids removes the wraparound
+            // collision risk of a monotonic counter (after 255 rejoins it
+            // would land on 0 = host, then start fighting with live clients).
+            // Host id is always 0, never appears in `senders`.
+            let id = {
+                let lock = senders_clone.lock().unwrap_or_else(|e| e.into_inner());
+                let mut candidate: u8 = 1;
+                while lock.contains_key(&candidate) {
+                    if candidate == u8::MAX {
+                        break;
+                    }
+                    candidate += 1;
+                }
+                candidate
+            };
 
             let mut welcome_stream = match stream.try_clone() {
                 Ok(s) => s,
@@ -636,6 +691,7 @@ pub fn start_host() -> std::io::Result<HostConn> {
         events: Arc::new(Mutex::new(event_rx)),
         senders,
         shutdown,
+        in_game,
     })
 }
 
@@ -698,6 +754,22 @@ pub fn start_client(addr: SocketAddr, nickname: &str) -> std::io::Result<ClientC
                     break;
                 }
             }
+            Ok(ServerMsg::CountdownStart { seconds }) => {
+                if reader_event_tx
+                    .send(ClientInEvent::CountdownStart { seconds })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(ServerMsg::CountdownCancel) => {
+                if reader_event_tx
+                    .send(ClientInEvent::CountdownCancel)
+                    .is_err()
+                {
+                    break;
+                }
+            }
             Ok(ServerMsg::Snapshot(snap)) => {
                 if reader_event_tx.send(ClientInEvent::Snapshot(snap)).is_err() {
                     break;
@@ -705,6 +777,10 @@ pub fn start_client(addr: SocketAddr, nickname: &str) -> std::io::Result<ClientC
             }
             Ok(ServerMsg::FullLobby) => {
                 let _ = reader_event_tx.send(ClientInEvent::FullLobby);
+                break;
+            }
+            Ok(ServerMsg::GameInProgress) => {
+                let _ = reader_event_tx.send(ClientInEvent::GameInProgress);
                 break;
             }
             Ok(ServerMsg::ProtocolMismatch { server_version }) => {
@@ -763,7 +839,25 @@ impl Plugin for NetPlugin {
             .init_resource::<RemoteInputs>()
             .init_resource::<NetEntities>()
             .init_resource::<LocalNickname>()
-            .init_resource::<PlayerNicknames>();
+            .init_resource::<PlayerNicknames>()
+            .add_systems(OnEnter(crate::GameState::Playing), set_host_in_game)
+            .add_systems(OnExit(crate::GameState::Playing), clear_host_in_game);
+    }
+}
+
+/// Mark the host's listener thread as "in game" so further joiners are
+/// rejected with `ServerMsg::GameInProgress`.
+fn set_host_in_game(ctx: Res<NetContext>) {
+    if let Some(host) = ctx.host.as_ref() {
+        host.in_game.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Clear the in-game flag when the round ends so the lobby can accept new
+/// joiners again on the next session.
+fn clear_host_in_game(ctx: Res<NetContext>) {
+    if let Some(host) = ctx.host.as_ref() {
+        host.in_game.store(false, Ordering::Relaxed);
     }
 }
 

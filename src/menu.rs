@@ -93,7 +93,7 @@ const ITEMS: [&str; 7] = [
     "QUIT",
 ];
 
-const SETTINGS_ROW_COUNT: usize = 7;
+const SETTINGS_ROW_COUNT: usize = 8;
 const SETTINGS_LABELS: [&str; SETTINGS_ROW_COUNT] = [
     "RESOLUTION",
     "WINDOW MODE",
@@ -101,8 +101,13 @@ const SETTINGS_LABELS: [&str; SETTINGS_ROW_COUNT] = [
     "FPS LIMIT",
     "QUALITY",
     "FPS COUNTER",
+    "RESET DEFAULTS",
     "BACK",
 ];
+
+/// Selection indices for action rows (Enter triggers, no left/right value).
+const SETTINGS_ROW_RESET: usize = 6;
+const SETTINGS_ROW_BACK: usize = 7;
 
 const BG_COLOR: Color = Color::srgb(0.012, 0.016, 0.022);
 const PANEL_COLOR: Color = Color::srgba(0.035, 0.04, 0.05, 0.94);
@@ -496,8 +501,13 @@ fn menu_navigate(
         }
     }
     if keys.just_pressed(KeyCode::Escape) {
-        ctx.disconnect();
-        std::process::exit(0);
+        // Esc moves the cursor onto WYJSCIE (index 6) — second Esc / Enter
+        // there exits.  This stops accidentally killing the app when a
+        // player just wanted to back out of a sub-menu.
+        if selection.0 != 6 {
+            selection.0 = 6;
+            sfx.send(SfxEvent::MenuMove);
+        }
     }
 }
 
@@ -662,7 +672,7 @@ fn settings_value_text(settings: &GraphicsSettings, index: usize) -> String {
         3 => settings.fps_cap_label(),
         4 => settings.quality_label().to_string(),
         5 => settings.show_fps_label().to_string(),
-        6 => String::new(),
+        // RESET DEFAULTS / BACK rows are action rows — no value text.
         _ => String::new(),
     }
 }
@@ -705,15 +715,29 @@ fn settings_input(
             5 => settings.toggle_show_fps(),
             _ => {}
         }
-        if selection.0 != 6 {
+        // Action rows (RESET / BACK) have no left/right value to cycle.
+        if selection.0 < SETTINGS_ROW_RESET {
             sfx.send(SfxEvent::MenuMove);
         }
     }
 
-    if keys.just_pressed(KeyCode::Enter) && selection.0 == 6 {
-        sfx.send(SfxEvent::MenuCancel);
-        next_state.set(GameState::Menu);
-        return;
+    if keys.just_pressed(KeyCode::Enter) {
+        match selection.0 {
+            SETTINGS_ROW_RESET => {
+                // Replace the resource with defaults — `is_changed()` then
+                // fires next frame and `apply_graphics_settings` pushes the
+                // window/vsync/etc. back to factory values.  The save-on-change
+                // system writes the new state to disk on the same beat.
+                *settings = GraphicsSettings::default();
+                sfx.send(SfxEvent::MenuSelect);
+            }
+            SETTINGS_ROW_BACK => {
+                sfx.send(SfxEvent::MenuCancel);
+                next_state.set(GameState::Menu);
+                return;
+            }
+            _ => {}
+        }
     }
     if keys.just_pressed(KeyCode::Escape) {
         sfx.send(SfxEvent::MenuCancel);

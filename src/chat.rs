@@ -80,10 +80,18 @@ impl Plugin for ChatPlugin {
             .init_resource::<ChatInputState>()
             .add_systems(OnEnter(GameState::Playing), spawn_chat_overlay)
             .add_systems(OnExit(GameState::Playing), (despawn_chat_overlay, reset_chat_state))
+            // Close any open chat input on pause so the typed buffer isn't
+            // committed when the player Esc's into the pause menu.
+            .add_systems(OnEnter(crate::PauseState::Paused), close_chat_on_pause)
             .add_systems(
                 Update,
                 (
-                    chat_input_system.in_set(ChatInputSet),
+                    // Chat input is gated on `Running` so Q/M presses during
+                    // the pause menu don't double-fire (pause menu disconnect
+                    // + chat buffer append on the same frame).
+                    chat_input_system
+                        .in_set(ChatInputSet)
+                        .run_if(in_state(crate::PauseState::Running)),
                     chat_age_lines,
                     chat_render_overlay,
                 )
@@ -91,6 +99,11 @@ impl Plugin for ChatPlugin {
                     .run_if(in_state(GameState::Playing)),
             );
     }
+}
+
+fn close_chat_on_pause(mut state: ResMut<ChatInputState>) {
+    state.open = false;
+    state.buffer.clear();
 }
 
 fn spawn_chat_overlay(mut commands: Commands, assets: Res<UiAssets>) {
@@ -294,12 +307,24 @@ fn send_local_chat(
         }
         NetMode::Client => {
             // Clients send to host and let the broadcast echo back so the
-            // line appears in our own log too.  Avoids divergence if the
-            // server rejects/edits it.
-            if let Some(client) = ctx.client.as_ref() {
-                let _ = client.sender.send(ClientMsg::Chat {
-                    text: text.to_string(),
-                });
+            // line appears in our own log too — keeps everyone's view in
+            // sync with whatever the server decided to emit.  If the send
+            // itself fails (writer thread gone → channel rx dropped) we
+            // echo locally as a fallback so the player still sees their
+            // own message instead of typing into the void.
+            let send_ok = ctx
+                .client
+                .as_ref()
+                .map(|c| {
+                    c.sender
+                        .send(ClientMsg::Chat {
+                            text: text.to_string(),
+                        })
+                        .is_ok()
+                })
+                .unwrap_or(false);
+            if !send_ok {
+                log.push(local_author(local_nick), text.to_string());
             }
         }
     }

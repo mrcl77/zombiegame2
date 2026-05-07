@@ -84,7 +84,17 @@ fn spawn_pause_ui(mut commands: Commands, assets: Res<UiAssets>, net: Res<NetMod
                     row_gap: Val::Px(22.0),
                     ..default()
                 },
-                background_color: BackgroundColor(Color::srgba(0.0, 0.0, 0.0, if is_multi { 0.5 } else { 0.7 })),
+                // MP runs the world while the local "pause" UI is up (it's
+                // really just an in-place menu, not a world-pause), so we keep
+                // the overlay lighter so the player can still read what's
+                // happening behind it.  SP fully pauses the simulation, so a
+                // darker overlay reads cleaner without any motion to peek at.
+                background_color: BackgroundColor(Color::srgba(
+                    0.0,
+                    0.0,
+                    0.0,
+                    if is_multi { 0.5 } else { 0.7 },
+                )),
                 z_index: ZIndex::Global(100),
                 ..default()
             },

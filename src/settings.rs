@@ -205,8 +205,33 @@ fn settings_path() -> PathBuf {
 
 fn load_settings() -> Option<GraphicsSettings> {
     let path = settings_path();
-    let data = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&data).ok()
+    let data = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            warn!(
+                "Failed to read graphics settings at {}: {}. Using defaults.",
+                path.display(),
+                e
+            );
+            return None;
+        }
+    };
+    match serde_json::from_str(&data) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            let mut bak = path.clone();
+            bak.set_extension("json.bak");
+            let _ = std::fs::write(&bak, &data);
+            warn!(
+                "Graphics settings at {} are corrupted ({}). Backed up to {}, using defaults.",
+                path.display(),
+                e,
+                bak.display()
+            );
+            None
+        }
+    }
 }
 
 fn save_settings(settings: &GraphicsSettings) {

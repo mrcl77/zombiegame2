@@ -2,7 +2,9 @@ use bevy::prelude::*;
 use std::collections::{HashMap, VecDeque};
 
 use crate::audio::SfxEvent;
-use crate::map::{Explodable, ExplodableObstacleIdx, MapObstacles, ObstacleShape};
+use crate::map::{
+    DestroyedExplodables, Explodable, ExplodableObstacleIdx, MapObstacles, ObstacleShape,
+};
 use crate::net::{is_authoritative, NetContext, NetEntities, NetId};
 use crate::pixelart::{Canvas, Rgba};
 use crate::player::{Player, PlayerDamagedEvent, PLAYER_RADIUS};
@@ -857,6 +859,7 @@ fn bullet_collision(
     mut zombies: Query<(Entity, &Transform, &mut Zombie, &NetId)>,
     mut explodables: Query<(Entity, &Transform, &mut Explodable, &ExplodableObstacleIdx)>,
     mut obstacles: ResMut<MapObstacles>,
+    mut destroyed: ResMut<DestroyedExplodables>,
     players: Query<&Player>,
     mut killed: EventWriter<ZombieKilledEvent>,
     mut explode: EventWriter<ExplodeEvent>,
@@ -864,7 +867,7 @@ fn bullet_collision(
     mut sfx: EventWriter<SfxEvent>,
     mut score: ResMut<Score>,
 ) {
-    let mult = max_money_mult(&players);
+    let mult = max_money_mult(players.iter());
     let host_local_id = ctx.my_id;
     for (b_entity, b_transform, bullet) in &bullets {
         let bp = b_transform.translation.truncate();
@@ -966,12 +969,20 @@ fn bullet_collision(
                     break;
                 }
                 expl.hp -= bullet.damage;
+                // Visual feedback for plink hits — without this the bullet
+                // disappears silently when it doesn't destroy the prop and
+                // it feels like a missed hit.  Flame puffs have their own
+                // dissipation visual so they opt out.
+                if !bullet.is_flame {
+                    spawn_impact_sparks(&mut commands, &assets, bp, bullet.velocity);
+                }
                 commands.entity(b_entity).despawn_recursive();
                 sfx.send(SfxEvent::Hit);
                 if expl.hp <= 0 {
                     if let Some(o) = obstacles.list.get_mut(obs_idx.0) {
                         o.shape = ObstacleShape::Circle(0.0);
                     }
+                    destroyed.indices.insert(obs_idx.0 as u32);
                     explode.send(ExplodeEvent {
                         pos: ep,
                         radius: expl.radius,
@@ -997,6 +1008,7 @@ fn explode_listener(
     mut zombies: Query<(Entity, &Transform, &mut Zombie)>,
     mut explodables: Query<(Entity, &Transform, &mut Explodable, &ExplodableObstacleIdx)>,
     mut obstacles: ResMut<MapObstacles>,
+    mut destroyed: ResMut<DestroyedExplodables>,
     players: Query<(&Transform, &Player)>,
     mut damage_evw: EventWriter<PlayerDamagedEvent>,
     mut killed_evw: EventWriter<ZombieKilledEvent>,
@@ -1006,7 +1018,7 @@ fn explode_listener(
     mut ctx: ResMut<NetContext>,
     mut net_entities: ResMut<NetEntities>,
 ) {
-    let mult = max_money_mult_from_tp(&players);
+    let mult = max_money_mult(players.iter().map(|(_, p)| p));
     let mut queue: Vec<ExplodeEvent> = events.read().copied().collect();
     while let Some(ev) = queue.pop() {
         for (z_ent, z_t, mut zombie) in &mut zombies {
@@ -1059,6 +1071,7 @@ fn explode_listener(
                     if let Some(o) = obstacles.list.get_mut(obs_idx.0) {
                         o.shape = ObstacleShape::Circle(0.0);
                     }
+                    destroyed.indices.insert(obs_idx.0 as u32);
                     queue.push(ExplodeEvent {
                         pos: ep,
                         radius: expl.radius,
@@ -1248,7 +1261,7 @@ fn fire_pool_update(
     mut score: ResMut<Score>,
 ) {
     let dt = time.delta_seconds();
-    let mult = max_money_mult(&players);
+    let mult = max_money_mult(players.iter());
     for (entity, mut fire, fire_t) in &mut fires {
         fire.lifetime -= dt;
         if fire.lifetime <= 0.0 {
@@ -1360,12 +1373,11 @@ fn despawn_all_bullets(
     net_entities.explosions.clear();
 }
 
-fn max_money_mult(players: &Query<&Player>) -> u8 {
-    players.iter().map(|p| p.money_mult).max().unwrap_or(1).max(1)
-}
-
-fn max_money_mult_from_tp(players: &Query<(&Transform, &Player)>) -> u8 {
-    players.iter().map(|(_, p)| p.money_mult).max().unwrap_or(1).max(1)
+/// Highest active money multiplier across all alive players (min 1× when
+/// nobody has a buff).  Used for kill payouts so all players benefit from
+/// the strongest active buff in the squad.
+fn max_money_mult<'a>(mut players: impl Iterator<Item = &'a Player>) -> u8 {
+    players.by_ref().map(|p| p.money_mult).max().unwrap_or(1).max(1)
 }
 
 // ── FX update systems ─────────────────────────────────────────────────

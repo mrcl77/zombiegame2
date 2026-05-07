@@ -30,18 +30,26 @@ use crate::{GameState, Score};
 
 // ─── Snapshot rate / interpolation tuning ───────────────────────────────
 //
-// Server broadcasts every Nth `FixedUpdate` tick (60 Hz), so at N=2 we
-// stream snapshots at ~30 Hz.  Inputs still flow at 60 Hz (they're cheap
-// and latency-sensitive), so this only affects bandwidth in the host→client
-// direction and the temporal granularity of remote-entity poses.
-const SNAPSHOT_INTERVAL_TICKS: u64 = 2;
+// Server broadcasts every Nth `FixedUpdate` tick (60 Hz).  At N=1 snapshots
+// ship at the full 60 Hz simulation rate.  Inputs flow independently at
+// 60 Hz too (they're cheap and latency-sensitive).
+//
+// 30 Hz (N=2) was visibly choppy on remote players even with interpolation —
+// alpha tracking at 60 Hz halves the worst-case stale-data window from
+// ~33 ms to ~17 ms, which on a 144 Hz monitor moves remote movement from
+// "stair-stepped" to "fluid".  Bandwidth doubles vs. 30 Hz but a typical
+// snapshot is well under 2 KB, so we're nowhere near the 256 KB cap on LAN.
+const SNAPSHOT_INTERVAL_TICKS: u64 = 1;
 /// Approximate gap between snapshots in seconds; used to size the interp
 /// buffer and the render-time delay.
 const SNAPSHOT_INTERVAL_SECS: f32 = SNAPSHOT_INTERVAL_TICKS as f32 / 60.0;
-/// Render remote entities this far behind the newest snapshot — a touch
-/// over one snapshot interval gives enough buffer to ride out jitter
-/// without making remote players feel laggy.
-const INTERP_DELAY_SECS: f32 = SNAPSHOT_INTERVAL_SECS * 1.6;
+/// Render remote entities this far behind the newest snapshot — large
+/// enough to ride out a couple of dropped/late snapshots without falling
+/// off the edge of the buffer (which would freeze remote pose at the
+/// newest sample for a frame).  ~3 snapshot intervals = ~50 ms of jitter
+/// budget at 60 Hz — barely perceptible on movement, very forgiving on
+/// transient TCP stalls.
+const INTERP_DELAY_SECS: f32 = SNAPSHOT_INTERVAL_SECS * 3.0;
 /// How long we keep snapshots in memory for interpolation lookups.
 const HISTORY_RETAIN_SECS: f32 = 0.5;
 
@@ -97,20 +105,27 @@ fn reset_snapshot_history(mut history: ResMut<SnapshotHistory>) {
     history.clear();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn server_receive_inputs(
-    ctx: Res<NetContext>,
+    mut commands: Commands,
+    mut ctx: ResMut<NetContext>,
     mut remote: ResMut<RemoteInputs>,
     mut nicknames: ResMut<PlayerNicknames>,
     mut chat_log: ResMut<ChatLog>,
+    mut net_entities: ResMut<crate::net::NetEntities>,
+    players: Query<(Entity, &Player)>,
 ) {
     let Some(host) = ctx.host.as_ref() else {
         return;
     };
     let events_arc = host.events.clone();
-    let Ok(rx) = events_arc.lock() else {
-        return;
-    };
-    while let Ok(e) = rx.try_recv() {
+    let mut events = Vec::new();
+    if let Ok(rx) = events_arc.lock() {
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+    }
+    for e in events {
         match e {
             ServerEvent::Input { id, input } => {
                 // Sanitise BEFORE merge — a malicious / buggy client could
@@ -135,6 +150,16 @@ fn server_receive_inputs(
             ServerEvent::Disconnected { id } => {
                 remote.0.remove(&id);
                 nicknames.0.remove(&id);
+                ctx.lobby_players.retain(|p| *p != id);
+                // Despawn the host-side Player entity for the gone client —
+                // otherwise it lingers as a stationary body forever, gets
+                // shipped in every snapshot, and still soaks up zombie
+                // collisions without being reachable by anyone.
+                if let Some(ent) = net_entities.players.remove(&id) {
+                    if players.get(ent).is_ok() {
+                        commands.entity(ent).despawn_recursive();
+                    }
+                }
             }
             ServerEvent::ChatRelay { id, text } => {
                 let author = nicknames
@@ -143,7 +168,9 @@ fn server_receive_inputs(
                     .cloned()
                     .unwrap_or_else(|| format!("P{id}"));
                 chat_log.push(author.clone(), text.clone());
-                broadcast(host, &ServerMsg::Chat { author, text });
+                if let Some(host) = ctx.host.as_ref() {
+                    broadcast(host, &ServerMsg::Chat { author, text });
+                }
             }
         }
     }
@@ -175,6 +202,7 @@ fn server_broadcast_snapshot(
     wave: Res<WaveState>,
     segments: Res<MapSegmentUnlockState>,
     nicknames: Res<PlayerNicknames>,
+    destroyed: Res<crate::map::DestroyedExplodables>,
     game_state: Res<State<GameState>>,
     mut bcast: Local<BroadcastState>,
 ) {
@@ -183,10 +211,8 @@ fn server_broadcast_snapshot(
     };
     bcast.tick += 1;
     let tick = bcast.tick;
-    // Rate-limit snapshot broadcast to ~30 Hz so we don't flood the link
-    // with redundant state.  Inputs still flow at the full FixedUpdate rate.
-    // We always send the very first tick so the client sees the world
-    // state immediately on join.
+    // Skip ticks per `SNAPSHOT_INTERVAL_TICKS` (currently 1 = 60 Hz), but
+    // always send tick 1 so a client sees world state immediately on join.
     if tick > 1 && !tick.is_multiple_of(SNAPSHOT_INTERVAL_TICKS) {
         return;
     }
@@ -216,6 +242,7 @@ fn server_broadcast_snapshot(
             y: q_pos(t.translation.y),
             rot: q_rot(t.rotation.to_euler(EulerRot::ZYX).0),
             kind: z.kind.as_u8(),
+            hp: z.hp.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
         })
         .collect();
 
@@ -318,6 +345,7 @@ fn server_broadcast_snapshot(
         game_over: *game_state.get() == GameState::GameOver,
         unlocked_segments_mask: segments.as_mask(),
         player_nicknames: nicknames_field,
+        destroyed_explodables: destroyed.indices.iter().copied().collect(),
     };
 
     broadcast(host, &ServerMsg::Snapshot(Box::new(snap)));
@@ -365,6 +393,8 @@ struct SnapshotApplyCtx<'w> {
     obstacles: Res<'w, MapObstacles>,
     chat_log: ResMut<'w, ChatLog>,
     died_evw: EventWriter<'w, PlayerDiedEvent>,
+    boss_spawn_evw: EventWriter<'w, crate::zombie::SpawnZombieEvent>,
+    destroyed: ResMut<'w, crate::map::DestroyedExplodables>,
 }
 
 /// Find the (older, newer) snapshot pair whose received-times bracket
@@ -476,8 +506,8 @@ fn client_apply_snapshots(
         (Without<Zombie>, Without<Bullet>, Without<Explosion>),
     >,
     mut zombies: Query<
-        &mut Transform,
-        (With<Zombie>, Without<Player>, Without<Bullet>, Without<Explosion>),
+        (&mut Transform, &mut Zombie),
+        (Without<Player>, Without<Bullet>, Without<Explosion>),
     >,
     mut bullets: Query<
         &mut Transform,
@@ -499,6 +529,8 @@ fn client_apply_snapshots(
     let obstacles = &apply_ctx.obstacles;
     let chat_log = &mut apply_ctx.chat_log;
     let died_evw = &mut apply_ctx.died_evw;
+    let boss_spawn_evw = &mut apply_ctx.boss_spawn_evw;
+    let destroyed = &mut apply_ctx.destroyed;
     let Some(client) = ctx.client.as_ref() else {
         return;
     };
@@ -522,6 +554,7 @@ fn client_apply_snapshots(
                 }
                 ClientInEvent::Disconnected
                 | ClientInEvent::FullLobby
+                | ClientInEvent::GameInProgress
                 | ClientInEvent::ProtocolMismatch { .. } => {
                     disconnect = true;
                 }
@@ -590,6 +623,15 @@ fn client_apply_snapshots(
         for (id, n) in nicks {
             nicknames.0.insert(*id, n.clone());
         }
+    }
+    // Destroyed explodables: full set on every snapshot, so a join-in-progress
+    // client catches up instantly.  We only write when the wire set differs
+    // from local — `is_changed` then triggers the cleanup system in map.rs
+    // to despawn matching entities + zero their obstacle shape.
+    let mut wire_set: HashSet<u32> =
+        lifecycle.destroyed_explodables.iter().copied().collect();
+    if wire_set != destroyed.indices {
+        std::mem::swap(&mut destroyed.indices, &mut wire_set);
     }
 
     // ── 4. Find interpolation pair for remote-entity poses ────────────────
@@ -752,7 +794,7 @@ fn client_apply_snapshots(
         let kind = ZombieKind::from_u8(nz.kind);
         match net_entities.zombies.get(&nz.id).copied() {
             Some(ent) => {
-                if let Ok(mut t) = zombies.get_mut(ent) {
+                if let Ok((mut t, mut zomb)) = zombies.get_mut(ent) {
                     let target = interp_or_fallback(
                         scratch.older_zombies.get(&nz.id),
                         scratch.newer_zombies.get(&nz.id),
@@ -762,6 +804,9 @@ fn client_apply_snapshots(
                     t.translation.x = target.x;
                     t.translation.y = target.y;
                     t.rotation = Quat::from_rotation_z(dq_rot(nz.rot));
+                    // Mirror authoritative HP — drives the giant HP bar
+                    // and any future per-zombie health overlays.
+                    zomb.hp = nz.hp as i32;
                 }
             }
             None => {
@@ -770,11 +815,17 @@ fn client_apply_snapshots(
                     &assets.zombie,
                     Vec2::new(dq_pos(nz.x), dq_pos(nz.y)),
                     nz.id,
-                    kind.base_hp(),
+                    nz.hp as i32,
                     kind.base_speed(),
                     kind,
                 );
                 net_entities.zombies.insert(nz.id, ent);
+                // Newly-appearing Giant on the wire: fire the boss-alert
+                // event locally so the UI flash plays on every client, not
+                // just the host where the spawn listener ran.
+                if matches!(kind, ZombieKind::Giant) {
+                    boss_spawn_evw.send(crate::zombie::SpawnZombieEvent { kind });
+                }
             }
         }
     }

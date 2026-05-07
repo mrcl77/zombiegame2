@@ -13,7 +13,6 @@ use crate::wave::WaveState;
 use crate::zombie::{SpawnZombieEvent, ZombieKilledEvent, ZombieKind};
 use crate::weapon::{PickupPromptHint, ThrowableAssets, ThrowableKind, WeaponAssets};
 use crate::zombie::Zombie;
-use crate::pixelart::Canvas;
 use crate::{GameState, Score, UiAssets};
 
 #[derive(Component)]
@@ -60,14 +59,6 @@ pub struct WaveIntroState {
 const WAVE_INTRO_DURATION: f32 = 2.4;
 
 #[derive(Component)]
-#[allow(dead_code)]
-pub struct ScreenVignette;
-
-#[derive(Component)]
-#[allow(dead_code)]
-pub struct FilmGrain;
-
-#[derive(Component)]
 pub struct ComboCounterRoot;
 
 #[derive(Component)]
@@ -99,17 +90,11 @@ pub struct ComboState {
 }
 
 const COMBO_TIMEOUT: f32 = 2.6;
-
-/// 4-frame procedural noise textures cycled to animate grain.  Built once
-/// at startup; the cycler swaps the active frame every ~80 ms.  Currently
-/// unused (overlay nodes disabled because they fogged the screen) but
-/// kept around so a milder revival is a one-line edit.
-#[derive(Resource)]
-#[allow(dead_code)]
-pub struct PostprocessAssets {
-    pub vignette: Handle<Image>,
-    pub grain_frames: [Handle<Image>; 4],
-}
+/// Duration of the combo-text punch animation in seconds (overshoot then
+/// settle).  Read by `update_combo` to drive the scale curve.
+const COMBO_PUNCH_DURATION: f32 = 0.25;
+/// Peak overshoot scale on a fresh kill — 1.0 + this = max scale.
+const COMBO_PUNCH_OVERSHOOT: f32 = 0.4;
 
 /// Full-screen overlay used for the red hit-flash and the low-HP pulsing
 /// vignette.  Both share the same node — alpha gets composed each frame
@@ -180,6 +165,12 @@ pub struct SlotIcon(pub u8);
 #[derive(Component)]
 pub struct SlotBorder(pub u8);
 
+/// Small per-slot text overlay showing ammo (slots 0/1) or count
+/// (slot 2, throwables).  Lets the player see all slot states at a
+/// glance instead of having to switch weapons to check.
+#[derive(Component)]
+pub struct SlotAmmoText(pub u8);
+
 pub struct UiPlugin;
 
 impl Plugin for UiPlugin {
@@ -188,7 +179,6 @@ impl Plugin for UiPlugin {
             .init_resource::<WaveIntroState>()
             .init_resource::<ComboState>()
             .init_resource::<BossAlertTimer>()
-            .add_systems(Startup, setup_postprocess_assets)
             .add_systems(OnEnter(GameState::Playing), (spawn_hud, reset_combo))
             .add_systems(
                 OnExit(GameState::Playing),
@@ -199,6 +189,7 @@ impl Plugin for UiPlugin {
                 (
                     update_hud,
                     update_slot_icons,
+                    update_slot_ammo_text,
                     update_floor_indicator,
                     update_pickup_prompt,
                     update_wave_intro,
@@ -225,15 +216,8 @@ fn spawn_hud(
     assets: Res<UiAssets>,
     weapon_assets: Res<WeaponAssets>,
     throwable_assets: Res<ThrowableAssets>,
-    postprocess: Res<PostprocessAssets>,
 ) {
     let font = assets.font.clone();
-
-    // ── Postprocess overlays disabled — vignette + film grain made the
-    // screen unreadable.  Keep `PostprocessAssets` allocated in case we
-    // want to re-enable a milder version later, but don't spawn the
-    // ImageBundle nodes.  Bloom still runs from the camera config.
-    let _ = &postprocess;
 
     // ── Bottom-left: Slots + Weapon + Ammo + HP ──
     commands
@@ -308,6 +292,26 @@ fn spawn_hud(
                                     ..default()
                                 },
                                 SlotIcon(i),
+                            ));
+                            // Tiny ammo / count overlay anchored bottom-right
+                            // of the slot.  `update_slot_ammo_text` keeps it
+                            // in sync with `Player.ammo[i]` / throwable_count.
+                            slot.spawn((
+                                TextBundle::from_section(
+                                    "",
+                                    TextStyle {
+                                        font: font.clone(),
+                                        font_size: 11.0,
+                                        color: Color::srgba(1.0, 0.95, 0.6, 0.95),
+                                    },
+                                )
+                                .with_style(Style {
+                                    position_type: PositionType::Absolute,
+                                    bottom: Val::Px(0.0),
+                                    right: Val::Px(2.0),
+                                    ..default()
+                                }),
+                                SlotAmmoText(i),
                             ));
                         });
                     }
@@ -616,6 +620,7 @@ fn spawn_hud(
                         row.spawn(NodeBundle {
                             style: Style {
                                 width: Val::Px(120.0),
+                                overflow: Overflow::clip_x(),
                                 ..default()
                             },
                             ..default()
@@ -1185,8 +1190,20 @@ fn update_hud(
     if cache.score != Some(score.0) {
         cache.score = Some(score.0);
         if let Ok(mut text) = score_text.get_single_mut() {
-            text.sections[0].value = format!("${}", score.0);
+            text.sections[0].value = format!("${}", format_compact_score(score.0));
         }
+    }
+}
+
+/// Compact score so a long match doesn't blow past the HUD width.
+/// `< 10K` → raw number, `< 1M` → `12.3K`, otherwise `9.9M`.
+fn format_compact_score(score: u32) -> String {
+    if score < 10_000 {
+        format!("{score}")
+    } else if score < 1_000_000 {
+        format!("{:.1}K", score as f32 / 1_000.0)
+    } else {
+        format!("{:.1}M", score as f32 / 1_000_000.0)
     }
 }
 
@@ -1233,6 +1250,39 @@ fn update_slot_icons(
         } else {
             Color::srgba(0.4, 0.4, 0.45, 0.4)
         };
+    }
+}
+
+fn update_slot_ammo_text(
+    ctx: Res<NetContext>,
+    players: Query<&Player>,
+    mut texts: Query<(&SlotAmmoText, &mut Text)>,
+) {
+    let Some(player) = players.iter().find(|p| p.id == ctx.my_id) else {
+        return;
+    };
+    for (slot, mut text) in &mut texts {
+        let value: String = match slot.0 {
+            0 | 1 => {
+                let idx = slot.0 as usize;
+                match player.slots[idx] {
+                    Some(w) if w.has_infinite_ammo() => "∞".to_string(),
+                    Some(_) => format!("{}", player.ammo[idx]),
+                    None => String::new(),
+                }
+            }
+            2 => {
+                if player.throwable_count > 0 {
+                    format!("x{}", player.throwable_count)
+                } else {
+                    String::new()
+                }
+            }
+            _ => String::new(),
+        };
+        if text.sections[0].value != value {
+            text.sections[0].value = value;
+        }
     }
 }
 
@@ -1304,7 +1354,6 @@ fn update_combo(
     state.time_since_kill += dt;
     state.punch_time += dt;
 
-    let mut bumped = false;
     for _ in events.read() {
         if state.time_since_kill > COMBO_TIMEOUT {
             state.count = 1;
@@ -1312,10 +1361,10 @@ fn update_combo(
             state.count += 1;
         }
         state.time_since_kill = 0.0;
+        // Reset punch_time so the bump animation re-plays on every kill —
+        // `state.punch_time` is read further down as the animation phase.
         state.punch_time = 0.0;
-        bumped = true;
     }
-    let _ = bumped;
 
     if state.time_since_kill > COMBO_TIMEOUT {
         state.count = 0;
@@ -1356,9 +1405,9 @@ fn update_combo(
 
     // Fade out as the streak window runs out.
     let fade = ((COMBO_TIMEOUT - state.time_since_kill) / COMBO_TIMEOUT).clamp(0.0, 1.0);
-    // Scale punch — quick overshoot to 1.4× then settle to 1.0 over 0.25 s.
-    let punch_phase = (state.punch_time / 0.25).clamp(0.0, 1.0);
-    let scale = 1.0 + (1.0 - punch_phase) * 0.4;
+    // Scale punch — quick overshoot then settle to 1.0.
+    let punch_phase = (state.punch_time / COMBO_PUNCH_DURATION).clamp(0.0, 1.0);
+    let scale = 1.0 + (1.0 - punch_phase) * COMBO_PUNCH_OVERSHOOT;
 
     if let Ok((mut text, mut transform)) = text_q.get_single_mut() {
         for sec in &mut text.sections {
@@ -1369,93 +1418,6 @@ fn update_combo(
         }
         transform.scale = Vec3::new(scale, scale, 1.0);
     }
-}
-
-fn setup_postprocess_assets(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
-    let vignette = images.add(build_vignette_image());
-    let grain_frames = [
-        images.add(build_grain_image(0)),
-        images.add(build_grain_image(1)),
-        images.add(build_grain_image(2)),
-        images.add(build_grain_image(3)),
-    ];
-    commands.insert_resource(PostprocessAssets {
-        vignette,
-        grain_frames,
-    });
-}
-
-/// Animated film grain overlay — cycles through 4 noise textures every
-/// ~80 ms.  Currently dormant; left in source so re-enabling is a single
-/// system-registration line away.
-#[allow(clippy::type_complexity, dead_code)]
-fn update_film_grain(
-    time: Res<Time>,
-    assets: Res<PostprocessAssets>,
-    mut q: Query<&mut UiImage, With<FilmGrain>>,
-    mut frame_timer: Local<f32>,
-    mut frame_idx: Local<usize>,
-) {
-    *frame_timer += time.delta_seconds();
-    if *frame_timer >= 0.08 {
-        *frame_timer = 0.0;
-        *frame_idx = (*frame_idx + 1) % assets.grain_frames.len();
-        if let Ok(mut img) = q.get_single_mut() {
-            img.texture = assets.grain_frames[*frame_idx].clone();
-        }
-    }
-}
-
-fn build_vignette_image() -> Image {
-    // Radial alpha gradient: transparent in the centre, dark only at the
-    // very corners.  Inner radius starts later (0.62 instead of 0.45) and
-    // the alpha cap is much lower so the vignette frames the action
-    // instead of blanketing it.
-    let size: i32 = 128;
-    let mut c = Canvas::new(size, size);
-    let cx = size as f32 * 0.5;
-    let cy = size as f32 * 0.5;
-    let max_d = ((cx * cx) + (cy * cy)).sqrt();
-    for y in 0..size {
-        for x in 0..size {
-            let dx = x as f32 + 0.5 - cx;
-            let dy = y as f32 + 0.5 - cy;
-            let d = (dx * dx + dy * dy).sqrt() / max_d;
-            let t = ((d - 0.62) / 0.38).clamp(0.0, 1.0);
-            let a = (t.powf(2.4) * 110.0) as u8;
-            if a > 0 {
-                c.put(x, y, [4, 5, 8, a]);
-            }
-        }
-    }
-    c.into_image()
-}
-
-fn build_grain_image(seed: u32) -> Image {
-    // 64×64 noise tile — only a small fraction of pixels carry any alpha
-    // so the grain reads as occasional speckles rather than a uniform
-    // fog.  Each frame uses a different seed so cycling them looks like
-    // animated grain.
-    let size: i32 = 64;
-    let mut c = Canvas::new(size, size);
-    let mut s: u32 = seed.wrapping_mul(0x9E3779B9).wrapping_add(0x12345);
-    for y in 0..size {
-        for x in 0..size {
-            s ^= s << 13;
-            s ^= s >> 17;
-            s ^= s << 5;
-            let n = (s & 0xFF) as u8;
-            // Sparse grain: only the brightest ~20% of pixels show, the
-            // rest stay fully transparent so most of the screen remains
-            // untouched.
-            if n < 200 {
-                continue;
-            }
-            let v = (n as i32 - 200).max(0) as u8 * 4;
-            c.put(x, y, [v, v, v, (v / 4).min(18)]);
-        }
-    }
-    c.into_image()
 }
 
 /// Big "WAVE N" splash centred on screen, fired once per new wave start.

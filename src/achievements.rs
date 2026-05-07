@@ -98,10 +98,39 @@ impl AchievementSave {
     pub fn load() -> Self {
         let mut path = save_dir();
         path.push("save.json");
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Self::default();
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to read achievements save at {}: {}. Using defaults.",
+                    path.display(),
+                    e
+                );
+                return Self::default();
+            }
+        };
+        match serde_json::from_str(&raw) {
+            Ok(save) => save,
+            Err(e) => {
+                // Keep a `.bak` copy of the corrupted blob so a player who
+                // notices their progress reset can recover it manually
+                // instead of finding the file silently overwritten on the
+                // next save.
+                let mut bak = path.clone();
+                bak.set_extension("json.bak");
+                let _ = std::fs::write(&bak, &raw);
+                warn!(
+                    "Achievements save at {} is corrupted ({}). Backed up to {}, starting from defaults.",
+                    path.display(),
+                    e,
+                    bak.display()
+                );
+                Self::default()
+            }
+        }
     }
 
     pub fn save(&self) {
@@ -126,7 +155,6 @@ pub struct AchievementTracker {
     pub weapons_bought: u8,
     pub took_damage_this_wave: bool,
     pub prev_in_break: bool,
-    pub game_start_time: f64,
     pub pending_toasts: VecDeque<AchievementId>,
 }
 
@@ -140,10 +168,18 @@ impl Default for AchievementTracker {
             weapons_bought: 0,
             took_damage_this_wave: false,
             prev_in_break: true,
-            game_start_time: 0.0,
             pending_toasts: VecDeque::new(),
         }
     }
+}
+
+/// Wall-clock seconds since the round began, but ticking only while
+/// `gameplay_active` is true.  Time spent in the SP pause menu, in lobby,
+/// or anywhere else doesn't count — so achievements like Speedrunner
+/// (reach wave 5 in under 3 min) measure actual play time.
+#[derive(Resource, Default)]
+pub struct GameplayClock {
+    pub elapsed_seconds: f64,
 }
 
 // ── Components ────────────────────────────────────────────────────
@@ -164,12 +200,18 @@ impl Plugin for AchievementsPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(AchievementSave::load())
             .init_resource::<AchievementTracker>()
+            .init_resource::<GameplayClock>()
             .add_systems(OnEnter(GameState::Playing), reset_tracker)
             .add_systems(OnExit(GameState::Playing), save_on_exit)
             .add_systems(
                 Update,
+                tick_gameplay_clock.run_if(crate::gameplay_active),
+            )
+            .add_systems(
+                Update,
                 (track_kills, track_damage, check_achievements)
                     .chain()
+                    .after(tick_gameplay_clock)
                     .run_if(in_state(GameState::Playing)),
             )
             .add_systems(Update, update_toasts)
@@ -182,14 +224,20 @@ impl Plugin for AchievementsPlugin {
     }
 }
 
+fn tick_gameplay_clock(time: Res<Time>, mut clock: ResMut<GameplayClock>) {
+    clock.elapsed_seconds += time.delta_seconds_f64();
+}
+
 // ── Systems ───────────────────────────────────────────────────────
 
-fn reset_tracker(mut tracker: ResMut<AchievementTracker>, time: Res<Time>) {
+fn reset_tracker(mut tracker: ResMut<AchievementTracker>, mut clock: ResMut<GameplayClock>) {
     *tracker = AchievementTracker {
-        game_start_time: time.elapsed_seconds_f64(),
         prev_in_break: true,
         ..default()
     };
+    // Round-local clock: zero on every game start so durations are
+    // independent of how long the app has been running.
+    clock.elapsed_seconds = 0.0;
 }
 
 fn save_on_exit(tracker: Res<AchievementTracker>, mut save: ResMut<AchievementSave>) {
@@ -199,10 +247,10 @@ fn save_on_exit(tracker: Res<AchievementTracker>, mut save: ResMut<AchievementSa
 
 fn track_kills(
     mut events: EventReader<ZombieKilledEvent>,
-    time: Res<Time>,
+    clock: Res<GameplayClock>,
     mut tracker: ResMut<AchievementTracker>,
 ) {
-    let now = time.elapsed_seconds_f64();
+    let now = clock.elapsed_seconds;
     for ev in events.read() {
         tracker.game_kills += 1;
         tracker.kill_times.push_back(now);
@@ -254,14 +302,13 @@ fn try_unlock(
 
 #[allow(clippy::too_many_arguments)]
 fn check_achievements(
-    time: Res<Time>,
+    clock: Res<GameplayClock>,
     wave: Res<WaveState>,
     zone_state: Res<ZoneState>,
     mut tracker: ResMut<AchievementTracker>,
     mut save: ResMut<AchievementSave>,
     mut sfx: EventWriter<SfxEvent>,
 ) {
-    let now = time.elapsed_seconds_f64();
     let mut any_new = false;
 
     if tracker.game_kills >= 1
@@ -340,13 +387,11 @@ fn check_achievements(
         any_new = true;
     }
 
-    if wave.current_wave >= 5 {
-        let elapsed = now - tracker.game_start_time;
-        if elapsed < 180.0
-            && try_unlock(AchievementId::Speedrunner, &mut save, &mut tracker)
-        {
-            any_new = true;
-        }
+    if wave.current_wave >= 5
+        && clock.elapsed_seconds < 180.0
+        && try_unlock(AchievementId::Speedrunner, &mut save, &mut tracker)
+    {
+        any_new = true;
     }
 
     if any_new {
