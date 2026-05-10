@@ -4,13 +4,38 @@ Top-down 2D zombie survival shooter napisany w Rust + [Bevy 0.14](https://bevyen
 Tryb single-player oraz kooperacja LAN do **4 graczy**, fale przeciwników, 11 broni
 i proceduralna pikselowa grafika generowana w runtime (brak zewnętrznych assetów graficznych).
 
+[![Release](https://github.com/mrcl77/zombiegame2/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/mrcl77/zombiegame2/actions/workflows/release.yml)
+
 > **Status:** wczesna wersja rozwojowa (`0.1.0`). Mechaniki gameplay są stabilne,
 > mapa i ekonomia broni nadal się zmieniają.
 
 ---
 
+## Pobierz binarkę
+
+Każdy push do `main` automatycznie buduje paczki dla trzech systemów i publikuje
+je jako rolling release [`latest`](https://github.com/mrcl77/zombiegame2/releases/latest).
+Linki poniżej zawsze wskazują **najnowszy** build:
+
+| System                       | Pobierz                                                                                                                                       |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Linux** (x86_64)           | [zombiegame2-linux-x86_64.tar.gz](https://github.com/mrcl77/zombiegame2/releases/latest/download/zombiegame2-linux-x86_64.tar.gz)             |
+| **macOS** (Apple Silicon)    | [zombiegame2-macos-aarch64.tar.gz](https://github.com/mrcl77/zombiegame2/releases/latest/download/zombiegame2-macos-aarch64.tar.gz)           |
+| **Windows** (x86_64)         | [zombiegame2-windows-x86_64.zip](https://github.com/mrcl77/zombiegame2/releases/latest/download/zombiegame2-windows-x86_64.zip)               |
+
+Po pobraniu rozpakuj archiwum i uruchom `zombiegame2` (lub `zombiegame2.exe`).
+Katalog `assets/` musi pozostać obok binarki — gra ładuje z niego font HUD oraz
+specyfikację mapy.
+
+> **macOS:** binarka nie jest podpisana — przy pierwszym uruchomieniu Gatekeeper
+> może ją zablokować. Odblokuj ją w *System Settings → Privacy & Security* lub
+> w terminalu: `xattr -dr com.apple.quarantine zombiegame2-macos-aarch64`.
+
+---
+
 ## Spis treści
 
+- [Pobierz binarkę](#pobierz-binarkę)
 - [Funkcjonalności](#funkcjonalności)
 - [Wymagania](#wymagania)
 - [Budowanie i uruchamianie](#budowanie-i-uruchamianie)
